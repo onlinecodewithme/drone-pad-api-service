@@ -1,0 +1,33 @@
+[Unit]
+Description=Drone Pad API Service
+Documentation=https://github.com/your-org/drone-pad-api-service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/x4mc1/Documents/drone-pad-api-service
+ExecStart=/home/x4mc1/Documents/drone-pad-api-service/venv/bin/python3 main.py
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Environment
+Environment=DRONE_PAD_LOG_LEVEL=INFO
+Environment=DRONE_PAD_PORT=8000
+Environment=DRONE_PAD_HOST=0.0.0.0
+
+# GPIO access — Pi 5 uses lgpio via /dev/gpiochip*
+# Running as root with full device access for hardware control
+SupplementaryGroups=gpio
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=drone-pad
+
+[Install]
+WantedBy=multi-user.target
