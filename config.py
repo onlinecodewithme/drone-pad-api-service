@@ -44,6 +44,21 @@ class Direction(IntEnum):
     REVERSE = 0
 
 
+class DockStatus(str, Enum):
+    """Status strings reported by the ESP32 dock-lock controller over BLE."""
+    IDLE = "IDLE"
+    UNDOCKING_M1 = "UNDOCKING_M1"
+    UNDOCKING_M2 = "UNDOCKING_M2"
+    UNDOCKING_COMPLETE = "UNDOCKING_COMPLETE"
+    DOCKING_M2 = "DOCKING_M2"
+    DOCKING_M1 = "DOCKING_M1"
+    DOCKING_PROP_OPEN = "DOCKING_PROP_OPEN"
+    DOCKING_PROP_CLOSE = "DOCKING_PROP_CLOSE"
+    DOCKING_COMPLETE = "DOCKING_COMPLETE"
+    ERROR = "ERROR"
+    UNKNOWN = "UNKNOWN"  # No status received yet, or an unparseable value
+
+
 # ---------------------------------------------------------------------------
 # Pin Configuration Dataclasses
 # ---------------------------------------------------------------------------
@@ -54,6 +69,7 @@ class StepperPins:
     step: int
     direction: int
     enable: int
+    direction_inverted: bool = False  # True if DIR wiring is reversed on this driver
 
 
 @dataclass(frozen=True)
@@ -80,6 +96,18 @@ class SwitchConfig:
     active_low: bool            # True = switch pulls pin LOW when triggered
 
 
+@dataclass(frozen=True)
+class DockingConfig:
+    """Connection parameters for the ESP32 dock-lock controller (BLE)."""
+    device_mac: str              # BLE MAC of the ESP32 (its WiFi MAC + 2)
+    service_uuid: str
+    command_uuid: str            # Write: send DOCK / UNDOCK / RESET / STATUS
+    status_uuid: str             # Read + Notify: DockStatus strings
+    device_name: str = "DockController"
+    connect_timeout_seconds: float = 10.0
+    command_timeout_seconds: float = 45.0  # Max wait for a *_COMPLETE / ERROR status
+
+
 # ---------------------------------------------------------------------------
 # Main Settings
 # ---------------------------------------------------------------------------
@@ -101,7 +129,7 @@ class Settings:
 
     # --- GPIO Pin Assignments ---
     opening_motor_pins: StepperPins = field(
-        default_factory=lambda: StepperPins(step=14, direction=16, enable=12)
+        default_factory=lambda: StepperPins(step=14, direction=16, enable=12, direction_inverted=True)
     )
     lift_motor_pins: StepperPins = field(
         default_factory=lambda: StepperPins(step=26, direction=13, enable=11)
@@ -136,6 +164,16 @@ class Settings:
         default_factory=lambda: SwitchConfig(
             debounce_ms=50,           # 50ms debounce
             active_low=True,          # Switch connects GPIO to GND
+        )
+    )
+
+    # --- Docking System (BLE, ESP32) ---
+    docking_config: DockingConfig = field(
+        default_factory=lambda: DockingConfig(
+            device_mac="70:4B:CA:7B:AF:A2",
+            service_uuid="4fafc201-1fb5-459e-8fcc-c5c9c331914b",
+            command_uuid="beb5483e-36e1-4688-b7f5-ea07361b26a8",
+            status_uuid="8c1c10ea-4536-4a5b-9c37-2f7a3e5c1d2b",
         )
     )
 
@@ -211,6 +249,7 @@ def load_settings() -> Settings:
             step=_env_int("DRONE_PAD_OPENING_STEP_PIN", 14),
             direction=_env_int("DRONE_PAD_OPENING_DIR_PIN", 16),
             enable=_env_int("DRONE_PAD_OPENING_ENABLE_PIN", 12),
+            direction_inverted=_env_bool("DRONE_PAD_OPENING_DIR_INVERTED", True),
         ),
         lift_motor_pins=StepperPins(
             step=_env_int("DRONE_PAD_LIFT_STEP_PIN", 26),
@@ -224,8 +263,8 @@ def load_settings() -> Settings:
             lift_lower=_env_int("DRONE_PAD_LIFT_LOWER_PIN", 3),
         ),
         opening_motor_config=MotorConfig(
-            step_delay_us=_env_int("DRONE_PAD_OPENING_STEP_DELAY_US", 500),
-            timeout_seconds=_env_float("DRONE_PAD_OPENING_TIMEOUT_S", 60.0),
+            step_delay_us=_env_int("DRONE_PAD_OPENING_STEP_DELAY_US", 50),
+            timeout_seconds=_env_float("DRONE_PAD_OPENING_TIMEOUT_S", 160.0),
             enable_active_low=_env_bool("DRONE_PAD_OPENING_ENABLE_ACTIVE_LOW", True),
         ),
         lift_motor_config=MotorConfig(
@@ -235,7 +274,16 @@ def load_settings() -> Settings:
         ),
         switch_config=SwitchConfig(
             debounce_ms=_env_int("DRONE_PAD_SWITCH_DEBOUNCE_MS", 50),
-            active_low=_env_bool("DRONE_PAD_SWITCH_ACTIVE_LOW", True),
+            active_low=_env_bool("DRONE_PAD_SWITCH_ACTIVE_LOW", False),
+        ),
+        docking_config=DockingConfig(
+            device_mac=os.environ.get("DRONE_PAD_DOCK_MAC", "70:4B:CA:7B:AF:A2"),
+            service_uuid=os.environ.get("DRONE_PAD_DOCK_SERVICE_UUID", "4fafc201-1fb5-459e-8fcc-c5c9c331914b"),
+            command_uuid=os.environ.get("DRONE_PAD_DOCK_CMD_UUID", "beb5483e-36e1-4688-b7f5-ea07361b26a8"),
+            status_uuid=os.environ.get("DRONE_PAD_DOCK_STATUS_UUID", "8c1c10ea-4536-4a5b-9c37-2f7a3e5c1d2b"),
+            device_name=os.environ.get("DRONE_PAD_DOCK_DEVICE_NAME", "DockController"),
+            connect_timeout_seconds=_env_float("DRONE_PAD_DOCK_CONNECT_TIMEOUT_S", 10.0),
+            command_timeout_seconds=_env_float("DRONE_PAD_DOCK_COMMAND_TIMEOUT_S", 45.0),
         ),
     )
 

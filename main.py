@@ -8,6 +8,7 @@ stop, and event log retrieval.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import os
@@ -24,6 +25,7 @@ from config import PadState, load_settings, Settings
 from gpio_manager import GPIOManager
 from motor_controller import MotorController
 from pad_state_machine import PadStateMachine, PadStatus, EventEntry
+from docking_controller import DockingController, DockingError
 
 # ---------------------------------------------------------------------------
 # Logging Setup
@@ -108,6 +110,23 @@ class SimTriggerRequest(BaseModel):
     triggered: bool = Field(True, description="True to trigger, False to release")
 
 
+class DockStatusResponse(BaseModel):
+    """Status of the BLE connection to the dock-lock (ESP32) controller."""
+    available: bool = Field(..., description="Whether the docking controller could be initialized (bleak installed)")
+    connected: bool = Field(..., description="Whether the BLE link is currently up")
+    status: str = Field(..., description="Last known status reported by the dock controller")
+    device_mac: Optional[str] = Field(None, description="BLE MAC address of the dock controller")
+    timestamp: str = Field(..., description="ISO 8601 UTC timestamp of this response")
+
+
+class DockCommandResponse(BaseModel):
+    """Standard response for dock/undock/reset commands."""
+    success: bool = Field(..., description="Whether the command was accepted")
+    message: str = Field(..., description="Human-readable result message")
+    status: str = Field(..., description="Dock controller status at the time of response")
+    timestamp: str = Field(..., description="ISO 8601 UTC timestamp")
+
+
 # ---------------------------------------------------------------------------
 # Application Globals
 # ---------------------------------------------------------------------------
@@ -116,6 +135,7 @@ settings: Optional[Settings] = None
 gpio: Optional[GPIOManager] = None
 motor: Optional[MotorController] = None
 pad: Optional[PadStateMachine] = None
+docking: Optional[DockingController] = None
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +147,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown lifecycle."""
-    global settings, gpio, motor, pad
+    global settings, gpio, motor, pad, docking
 
     # --- Startup ---
     settings = load_settings()
@@ -143,6 +163,19 @@ async def lifespan(app: FastAPI):
     motor = MotorController(gpio, settings)
     pad = PadStateMachine(gpio, motor, settings)
 
+    # Docking (BLE) is a separate subsystem — its absence shouldn't stop
+    # the pad from working, so failures here are logged, not raised.
+    try:
+        docking = DockingController.from_settings(settings)
+        await docking.start()
+        logger.info(
+            "Docking controller starting — connecting to %s in the background",
+            settings.docking_config.device_mac,
+        )
+    except ImportError as exc:
+        logger.warning("Docking controller unavailable: %s", exc)
+        docking = None
+
     logger.info(
         "Service ready — listening on %s:%d (simulation=%s)",
         settings.host, settings.port, gpio.is_simulation,
@@ -156,6 +189,12 @@ async def lifespan(app: FastAPI):
     if pad is not None:
         try:
             pad.emergency_stop()
+        except Exception:
+            pass
+
+    if docking is not None:
+        try:
+            await docking.stop()
         except Exception:
             pass
 
@@ -377,6 +416,110 @@ async def sim_trigger_switch(req: SimTriggerRequest):
         "state": status.state.value,
         "timestamp": _now_iso(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Docking Endpoints (BLE, ESP32 dock-lock controller)
+# ---------------------------------------------------------------------------
+
+def _require_docking() -> DockingController:
+    if docking is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Docking controller is not available (bleak not installed on this host)",
+        )
+    return docking
+
+
+def _dock_command_response(success: bool, message: str) -> DockCommandResponse:
+    return DockCommandResponse(
+        success=success,
+        message=message,
+        status=docking.last_status.value,
+        timestamp=_now_iso(),
+    )
+
+
+@app.get("/api/dock/status", response_model=DockStatusResponse, tags=["docking"])
+async def get_dock_status():
+    """
+    Get the current state of the BLE link and the dock-lock controller.
+
+    `status` reflects the last value reported by the ESP32 over BLE
+    notifications, including in-progress states like DOCKING_M1 or
+    UNDOCKING_PROP_OPEN — poll this while a dock/undock command is running.
+    """
+    return DockStatusResponse(
+        available=docking is not None,
+        connected=docking.is_connected if docking is not None else False,
+        status=docking.last_status.value if docking is not None else "UNAVAILABLE",
+        device_mac=docking.device_mac if docking is not None else None,
+        timestamp=_now_iso(),
+    )
+
+
+@app.post("/api/dock/dock", response_model=DockCommandResponse, tags=["docking"])
+async def dock_command():
+    """
+    Start the docking sequence on the ESP32 dock-lock controller.
+
+    Runs in the background — this returns immediately once the command is
+    sent; poll GET /api/dock/status to watch progress and see the final
+    DOCKING_COMPLETE (or ERROR) status.
+    """
+    controller = _require_docking()
+
+    if not controller.is_connected:
+        return _dock_command_response(False, "Not connected to dock controller")
+    if controller.is_busy:
+        return _dock_command_response(False, "A dock/undock command is already in progress")
+
+    asyncio.create_task(_run_dock_command(controller.dock, "DOCK"))
+    return _dock_command_response(True, "Dock sequence started")
+
+
+@app.post("/api/dock/undock", response_model=DockCommandResponse, tags=["docking"])
+async def undock_command():
+    """
+    Start the undocking sequence on the ESP32 dock-lock controller.
+
+    Runs in the background — this returns immediately once the command is
+    sent; poll GET /api/dock/status to watch progress and see the final
+    UNDOCKING_COMPLETE (or ERROR) status.
+    """
+    controller = _require_docking()
+
+    if not controller.is_connected:
+        return _dock_command_response(False, "Not connected to dock controller")
+    if controller.is_busy:
+        return _dock_command_response(False, "A dock/undock command is already in progress")
+
+    asyncio.create_task(_run_dock_command(controller.undock, "UNDOCK"))
+    return _dock_command_response(True, "Undock sequence started")
+
+
+@app.post("/api/dock/reset", response_model=DockCommandResponse, tags=["docking"])
+async def dock_reset_command():
+    """Send RESET to the dock-lock controller — stops its motors and returns it to IDLE."""
+    controller = _require_docking()
+
+    if not controller.is_connected:
+        return _dock_command_response(False, "Not connected to dock controller")
+
+    try:
+        await controller.reset()
+        return _dock_command_response(True, "RESET sent")
+    except DockingError as exc:
+        return _dock_command_response(False, str(exc))
+
+
+async def _run_dock_command(command_coro, label: str) -> None:
+    """Await a dock()/undock() call started from a request handler and log the outcome."""
+    try:
+        result = await command_coro()
+        logger.info("%s finished: %s", label, result.value)
+    except DockingError as exc:
+        logger.error("%s failed: %s", label, exc)
 
 
 # ---------------------------------------------------------------------------

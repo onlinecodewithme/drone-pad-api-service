@@ -3,3 +3,4 @@ uvicorn[standard]>=0.24.0
 RPi.GPIO>=0.7.1
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+bleak>=0.21.0
