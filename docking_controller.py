@@ -81,6 +81,7 @@ class DockingController:
         self._config = config
         self._client: Optional[BleakClient] = None
         self._status = DockStatus.UNKNOWN
+        self._terminal_status: Optional[DockStatus] = None
         self._command_done = asyncio.Event()
         self._command_lock = asyncio.Lock()
         self._reconnect_task: Optional[asyncio.Task] = None
@@ -139,6 +140,15 @@ class DockingController:
 
         self._client = client
         logger.info("Connected to dock controller")
+
+        # Notifications only fire on a state *change*, and the firmware
+        # deliberately suppresses the very first one after boot — so seed
+        # our cached status with an active read instead of waiting for a
+        # notify that may never come (e.g. right after boot or RESET).
+        try:
+            self._status = await self.get_status()
+        except DockingConnectionError:
+            pass
 
     async def disconnect(self) -> None:
         """Disconnect from the dock controller, if connected."""
@@ -235,6 +245,7 @@ class DockingController:
 
         async with self._command_lock:
             self._command_done.clear()
+            self._terminal_status = None
             await self._write_command(command)
 
             try:
@@ -244,16 +255,22 @@ class DockingController:
                     f"No terminal status received within {timeout:.1f}s after {command}"
                 ) from exc
 
-            if self._status == DockStatus.ERROR:
+            # Read the status captured at the moment it went terminal, not
+            # self._status — the firmware follows *_COMPLETE with a second
+            # IDLE notification almost immediately, which would otherwise
+            # overwrite it before this coroutine gets scheduled again.
+            result = self._terminal_status
+            if result == DockStatus.ERROR:
                 raise DockingError(f"{command} failed — dock controller reported ERROR")
 
-            return self._status
+            return result
 
     def _on_status_notify(self, _sender, data: bytearray) -> None:
         status = self._parse_status(data)
         self._status = status
         logger.info("Dock status: %s", status.value)
         if status.value in _TERMINAL_STATUSES:
+            self._terminal_status = status
             self._command_done.set()
 
     @staticmethod
