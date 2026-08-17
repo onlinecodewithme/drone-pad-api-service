@@ -26,7 +26,9 @@ class PadState(str, Enum):
     CLOSED = "CLOSED"
     OPENING_SLIDE = "OPENING_SLIDE"
     OPENING_LIFT = "OPENING_LIFT"
+    UNDOCKING = "UNDOCKING"  # Pad physically open, waiting for the BLE UNDOCK to complete
     OPEN = "OPEN"
+    DOCKING = "DOCKING"      # Close requested; waiting for the BLE DOCK to complete before moving
     CLOSING_LIFT = "CLOSING_LIFT"
     CLOSING_SLIDE = "CLOSING_SLIDE"
     ERROR = "ERROR"

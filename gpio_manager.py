@@ -217,21 +217,35 @@ class GPIOManager:
             )
 
         lsp = self._settings.limit_switch_pins
-        for name, pin in [
+        switch_pins = [
             ("open_limit",  lsp.open_limit),
             ("close_limit", lsp.close_limit),
             ("lift_upper",  lsp.lift_upper),
             ("lift_lower",  lsp.lift_lower),
-        ]:
+        ]
+        for name, pin in switch_pins:
             if self._simulation:
                 self._sim.claim_input(pin, pull_up=True)
             else:
                 lgpio.gpio_claim_input(self._handle, pin, lgpio.SET_PULL_UP)
                 self._claimed_pins.append(pin)
 
-            self._switch_last_state[pin] = False
+        # Seed each switch's confirmed state from a real read, not an
+        # assumed default — otherwise every switch reports "not triggered"
+        # until it happens to be polled twice with a debounce window
+        # between the calls, silently misreporting the pad's true physical
+        # position on every restart until something exercises it.
+        time.sleep(0.02)  # let freshly-claimed pull-ups settle (~20ms)
+        for name, pin in switch_pins:
+            raw_level = self._read(pin)
+            raw_triggered = (raw_level == 0) if self._switch_config.active_low \
+                            else (raw_level == 1)
+            self._switch_last_state[pin] = raw_triggered
             self._switch_last_change[pin] = None
-            logger.info("Limit switch '%s' initialized on GPIO %d", name, pin)
+            logger.info(
+                "Limit switch '%s' initialized on GPIO %d (initial=%s)",
+                name, pin, "TRIGGERED" if raw_triggered else "released",
+            )
 
         self._initialized = True
         logger.info("GPIO initialization complete")

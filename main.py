@@ -14,18 +14,19 @@ import sys
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Literal, Optional, List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from config import PadState, load_settings, Settings
+from config import Direction, MotorId, PadState, load_settings, Settings
 from gpio_manager import GPIOManager
 from motor_controller import MotorController
 from pad_state_machine import PadStateMachine, PadStatus, EventEntry
 from docking_controller import DockingController, DockingError
+from debug_controller import DebugMotorController
 
 # ---------------------------------------------------------------------------
 # Logging Setup
@@ -127,6 +128,45 @@ class DockCommandResponse(BaseModel):
     timestamp: str = Field(..., description="ISO 8601 UTC timestamp")
 
 
+class DebugJogRequest(BaseModel):
+    """Request to jog a single motor toward one of its limit switches."""
+    direction: Literal["FORWARD", "REVERSE"] = Field(
+        ...,
+        description=(
+            "OPENING: FORWARD=slide open, REVERSE=slide close. "
+            "LIFT: FORWARD=lift up, REVERSE=lift down."
+        ),
+    )
+
+
+class DebugCommandResponse(BaseModel):
+    """Standard response for debug jog/stop commands."""
+    success: bool = Field(..., description="Whether the command was accepted")
+    message: str = Field(..., description="Human-readable result message")
+    timestamp: str = Field(..., description="ISO 8601 UTC timestamp")
+
+
+class DebugJogStatusResponse(BaseModel):
+    """Status of the current/last single-axis debug jog."""
+    running: bool = Field(..., description="Whether a jog is currently in progress")
+    motor_id: Optional[str] = Field(None, description="Motor being jogged (OPENING or LIFT)")
+    direction: Optional[str] = Field(None, description="FORWARD or REVERSE")
+    started_at: Optional[str] = Field(None, description="ISO 8601 UTC timestamp the jog started")
+    elapsed_seconds: Optional[float] = Field(None, description="Seconds elapsed, while running")
+    last_result: Optional[str] = Field(None, description="success | timeout | cancelled | error")
+    last_message: Optional[str] = Field(None, description="Detail for the last result")
+    timestamp: str = Field(..., description="ISO 8601 UTC timestamp of this response")
+
+
+class LimitSwitchStatusResponse(BaseModel):
+    """Raw debounced state of all four limit switches — no motor movement."""
+    open_limit: bool = Field(..., description="OPENING motor's slide-open limit")
+    close_limit: bool = Field(..., description="OPENING motor's slide-close limit")
+    lift_upper: bool = Field(..., description="LIFT motor's up limit")
+    lift_lower: bool = Field(..., description="LIFT motor's down limit")
+    timestamp: str = Field(..., description="ISO 8601 UTC timestamp")
+
+
 # ---------------------------------------------------------------------------
 # Application Globals
 # ---------------------------------------------------------------------------
@@ -136,6 +176,7 @@ gpio: Optional[GPIOManager] = None
 motor: Optional[MotorController] = None
 pad: Optional[PadStateMachine] = None
 docking: Optional[DockingController] = None
+debug_motor: Optional[DebugMotorController] = None
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +188,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown lifecycle."""
-    global settings, gpio, motor, pad, docking
+    global settings, gpio, motor, pad, docking, debug_motor
 
     # --- Startup ---
     settings = load_settings()
@@ -161,10 +202,12 @@ async def lifespan(app: FastAPI):
     gpio.initialize()
 
     motor = MotorController(gpio, settings)
-    pad = PadStateMachine(gpio, motor, settings)
+    debug_motor = DebugMotorController(gpio, motor, settings)
 
     # Docking (BLE) is a separate subsystem — its absence shouldn't stop
-    # the pad from working, so failures here are logged, not raised.
+    # the pad's motors from working standalone, so failures here are
+    # logged, not raised. PadStateMachine handles docking=None safely by
+    # refusing open()/close() with a clear message (see _docking_precheck).
     try:
         docking = DockingController.from_settings(settings)
         await docking.start()
@@ -175,6 +218,11 @@ async def lifespan(app: FastAPI):
     except ImportError as exc:
         logger.warning("Docking controller unavailable: %s", exc)
         docking = None
+
+    # PadStateMachine bridges into docking's async calls via
+    # run_coroutine_threadsafe(), which needs the actual running loop.
+    loop = asyncio.get_running_loop()
+    pad = PadStateMachine(gpio, motor, settings, docking=docking, loop=loop)
 
     logger.info(
         "Service ready — listening on %s:%d (simulation=%s)",
@@ -188,7 +236,7 @@ async def lifespan(app: FastAPI):
 
     if pad is not None:
         try:
-            pad.emergency_stop()
+            await _run_blocking(pad.emergency_stop)
         except Exception:
             pass
 
@@ -254,6 +302,26 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def _run_blocking(fn, *args):
+    """
+    Run a synchronous PadStateMachine/DebugMotorController call off the
+    event loop.
+
+    Several of these methods (emergency_stop(), close()'s interrupt path,
+    debug jog stop()) call thread.join()/future.result() internally —
+    genuinely blocking calls. Calling them directly from an `async def`
+    endpoint blocks the entire event loop for that duration, which is
+    also where DockingController's BLE coroutines run — including any
+    docking command the blocked method itself schedules via
+    run_coroutine_threadsafe(). That's a real deadlock: the scheduled
+    coroutine can't run until the blocking call returns, but the blocking
+    call is waiting on that same coroutine's result. Offloading to the
+    default thread pool keeps the loop free the whole time.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fn, *args)
+
+
 def _command_response(result: dict) -> CommandResponse:
     """Build a CommandResponse from a state machine result dict."""
     status = pad.get_status()
@@ -304,12 +372,29 @@ async def open_pad():
     """
     Start the pad open sequence.
 
-    Sequence: Slide open (NEMA 23) → Lift up (NEMA 17)
+    Sequence: Slide open (NEMA 23) → Lift up (NEMA 17) → UNDOCK over BLE.
+    The pad only reaches OPEN once the docking system confirms
+    UNDOCKING_COMPLETE — UNDOCK is never sent unless lift_upper is
+    confirmed triggered.
 
-    Returns 200 with success=false if the command cannot be executed
-    in the current state (e.g., pad is closing or in error).
+    Self-healing: this can be called from any idle state, including
+    ERROR (e.g. after a power cycle whose limit switches hadn't settled
+    yet) — every stage live-verifies the pad's actual position via its
+    limit switches rather than trusting remembered state, and safely
+    no-ops any stage that's already done. No manual reset required.
+
+    Returns 200 with success=false only if the pad is genuinely
+    mid-close (a real close sequence is in progress) or a debug axis jog
+    (POST /api/debug/motor/{motor_id}/jog) is running.
     """
-    result = pad.open()
+    if debug_motor is not None and debug_motor.get_status().running:
+        return CommandResponse(
+            success=False,
+            message="A debug motor jog is in progress — stop it first (POST /api/debug/motor/stop)",
+            state=pad.get_status().state.value,
+            timestamp=_now_iso(),
+        )
+    result = await _run_blocking(pad.open)
     return _command_response(result)
 
 
@@ -318,12 +403,31 @@ async def close_pad():
     """
     Start the pad close sequence, or interrupt an in-progress open.
 
-    Sequence: Lift down (NEMA 17) → Slide close (NEMA 23)
+    Sequence: DOCK over BLE (only if currently lifted) → Lift down
+    (NEMA 17) → Slide close (NEMA 23). DOCK is skipped entirely if the
+    pad isn't confirmed lifted right now (already closed, or an open
+    interrupted before the lift finished) — there's nothing to dock in
+    that case. When DOCK does run, it must complete (DOCKING_COMPLETE)
+    before either motor moves.
 
-    If the pad is currently opening, this will interrupt the open
-    sequence and begin closing from the current position.
+    Self-healing: this can be called from any idle state, including
+    ERROR — every stage live-verifies the pad's actual position via its
+    limit switches, so it correctly recognizes "already closed" and
+    resolves in under a second, or drives whatever's left to a known
+    limit. No manual reset required.
+
+    Interrupting mid-UNDOCK/DOCK is rejected — wait for it to finish or
+    issue emergency-stop. Returns success=false only if the pad is
+    genuinely mid-close already, or a debug axis jog is running.
     """
-    result = pad.close()
+    if debug_motor is not None and debug_motor.get_status().running:
+        return CommandResponse(
+            success=False,
+            message="A debug motor jog is in progress — stop it first (POST /api/debug/motor/stop)",
+            state=pad.get_status().state.value,
+            timestamp=_now_iso(),
+        )
+    result = await _run_blocking(pad.close)
     return _command_response(result)
 
 
@@ -338,7 +442,7 @@ async def toggle_pause():
 
     Returns success=false if no operation is in progress.
     """
-    result = pad.toggle()
+    result = await _run_blocking(pad.toggle)
     return _command_response(result)
 
 
@@ -349,9 +453,11 @@ async def emergency_stop():
 
     All motor drivers are disabled at the hardware level. The pad
     must be reset (POST /api/reset) before normal commands will
-    be accepted again.
+    be accepted again. Also cancels any in-progress debug axis jog.
     """
-    result = pad.emergency_stop()
+    if debug_motor is not None:
+        await _run_blocking(debug_motor.stop)
+    result = await _run_blocking(pad.emergency_stop)
     return _command_response(result)
 
 
@@ -363,7 +469,7 @@ async def reset_pad():
     Only available when the pad is in ERROR state and no sequence
     thread is running.
     """
-    result = pad.reset_from_error()
+    result = await _run_blocking(pad.reset_from_error)
     return _command_response(result)
 
 
@@ -520,6 +626,80 @@ async def _run_dock_command(command_coro, label: str) -> None:
         logger.info("%s finished: %s", label, result.value)
     except DockingError as exc:
         logger.error("%s failed: %s", label, exc)
+
+
+# ---------------------------------------------------------------------------
+# Debug Endpoints — isolated single-axis motor testing
+# ---------------------------------------------------------------------------
+
+@app.get("/api/debug/limits", response_model=LimitSwitchStatusResponse, tags=["debug"])
+async def get_limit_switches():
+    """
+    Read all four limit switches directly — no motor movement.
+
+    Trigger them by hand to confirm wiring/polarity before jogging a motor.
+    """
+    return LimitSwitchStatusResponse(
+        open_limit=gpio.is_open_limit_triggered(),
+        close_limit=gpio.is_close_limit_triggered(),
+        lift_upper=gpio.is_lift_upper_triggered(),
+        lift_lower=gpio.is_lift_lower_triggered(),
+        timestamp=_now_iso(),
+    )
+
+
+@app.post("/api/debug/motor/{motor_id}/jog", response_model=DebugCommandResponse, tags=["debug"])
+async def jog_motor(motor_id: MotorId, req: DebugJogRequest):
+    """
+    Jog a single motor toward one limit switch, independent of the full
+    pad sequence. Runs in the background — poll GET /api/debug/motor/status
+    to watch it and see the final result (success/timeout/cancelled/error).
+
+    Allowed when the pad is CLOSED, OPEN, or in ERROR — ERROR is exactly
+    when this is needed most, to manually jog to a known limit before
+    POST /api/reset can verify the pad's real position. Rejected during
+    an active sequence stage (OPENING_SLIDE, UNDOCKING, etc.), where a
+    real motor move or BLE operation could genuinely be in flight, or if
+    another debug jog is already running.
+    """
+    pad_state = pad.get_status().state
+    if pad_state not in (PadState.CLOSED, PadState.OPEN, PadState.ERROR):
+        return DebugCommandResponse(
+            success=False,
+            message=f"Pad must be idle or in ERROR to jog a debug axis (current state: {pad_state.value})",
+            timestamp=_now_iso(),
+        )
+
+    direction = Direction.FORWARD if req.direction == "FORWARD" else Direction.REVERSE
+    result = await _run_blocking(debug_motor.jog, motor_id, direction)
+    return DebugCommandResponse(
+        success=result["success"], message=result["message"], timestamp=_now_iso(),
+    )
+
+
+@app.post("/api/debug/motor/stop", response_model=DebugCommandResponse, tags=["debug"])
+async def stop_jog():
+    """Cancel the current debug jog, if any, and disable the motor driver."""
+    result = await _run_blocking(debug_motor.stop)
+    return DebugCommandResponse(
+        success=result["success"], message=result["message"], timestamp=_now_iso(),
+    )
+
+
+@app.get("/api/debug/motor/status", response_model=DebugJogStatusResponse, tags=["debug"])
+async def get_jog_status():
+    """Get the status of the current/last debug jog."""
+    status = debug_motor.get_status()
+    return DebugJogStatusResponse(
+        running=status.running,
+        motor_id=status.motor_id,
+        direction=status.direction,
+        started_at=status.started_at,
+        elapsed_seconds=status.elapsed_seconds,
+        last_result=status.last_result,
+        last_message=status.last_message,
+        timestamp=_now_iso(),
+    )
 
 
 # ---------------------------------------------------------------------------
