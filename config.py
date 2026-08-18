@@ -47,18 +47,26 @@ class Direction(IntEnum):
 
 
 class DockStatus(str, Enum):
-    """Status strings reported by the ESP32 dock-lock controller over BLE."""
-    IDLE = "IDLE"
+    """
+    Status strings reported by the ESP32 dock-lock controller over BLE.
+
+    DOCKED/UNDOCKED are the two stable resting states — the firmware
+    transitions directly into them (verified against its limit switches,
+    never assumed) and stays there; there's no separate transient
+    "*_COMPLETE" pulse that then reverts to a generic idle. UNKNOWN means
+    the firmware itself can't currently verify its position from the
+    switches — treat that the same as ERROR for any safety decision.
+    """
+    UNKNOWN = "UNKNOWN"     # Position not verified — parse failures also map here
+    DOCKED = "DOCKED"        # Stable: drone secured
+    UNDOCKED = "UNDOCKED"     # Stable: drone released, safe to fly
     UNDOCKING_M1 = "UNDOCKING_M1"
     UNDOCKING_M2 = "UNDOCKING_M2"
-    UNDOCKING_COMPLETE = "UNDOCKING_COMPLETE"
     DOCKING_M2 = "DOCKING_M2"
     DOCKING_M1 = "DOCKING_M1"
     DOCKING_PROP_OPEN = "DOCKING_PROP_OPEN"
     DOCKING_PROP_CLOSE = "DOCKING_PROP_CLOSE"
-    DOCKING_COMPLETE = "DOCKING_COMPLETE"
     ERROR = "ERROR"
-    UNKNOWN = "UNKNOWN"  # No status received yet, or an unparseable value
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +115,12 @@ class DockingConfig:
     status_uuid: str             # Read + Notify: DockStatus strings
     device_name: str = "DockController"
     connect_timeout_seconds: float = 10.0
-    command_timeout_seconds: float = 45.0  # Max wait for a *_COMPLETE / ERROR status
+    # Max wait for a *_COMPLETE / ERROR status. A full DOCK cycle
+    # (M1 -> M2 -> PROP_OPEN -> PROP_CLOSE) has been observed taking
+    # ~60-90s on real hardware — 45s was set before the propeller-closer
+    # motor (M3) was wired up and cut this off mid-cycle. Generous margin
+    # over the real timing, not a tight bound.
+    command_timeout_seconds: float = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -148,14 +161,17 @@ class Settings:
     # --- Motor Parameters ---
     opening_motor_config: MotorConfig = field(
         default_factory=lambda: MotorConfig(
-            step_delay_us=500,        # 500μs → ~1000 steps/sec
+            step_delay_us=750,        # 750μs/step — was 500 (the enforced floor)
             timeout_seconds=60.0,     # 60s max for full slide travel
             enable_active_low=True,
         )
     )
     lift_motor_config: MotorConfig = field(
         default_factory=lambda: MotorConfig(
-            step_delay_us=800,        # 800μs → ~625 steps/sec
+            step_delay_us=550,        # 550μs/step — was 1100. Driver DIP switches
+                                       # changed (microstepping), so re-tuned faster.
+                                       # Keep above _MIN_STEP_DELAY_US (500) in
+                                       # gpio_manager.py or it's silently clamped.
             timeout_seconds=30.0,     # 30s max for full lift travel
             enable_active_low=True,
         )
@@ -265,12 +281,12 @@ def load_settings() -> Settings:
             lift_lower=_env_int("DRONE_PAD_LIFT_LOWER_PIN", 3),
         ),
         opening_motor_config=MotorConfig(
-            step_delay_us=_env_int("DRONE_PAD_OPENING_STEP_DELAY_US", 50),
+            step_delay_us=_env_int("DRONE_PAD_OPENING_STEP_DELAY_US", 750),
             timeout_seconds=_env_float("DRONE_PAD_OPENING_TIMEOUT_S", 160.0),
             enable_active_low=_env_bool("DRONE_PAD_OPENING_ENABLE_ACTIVE_LOW", True),
         ),
         lift_motor_config=MotorConfig(
-            step_delay_us=_env_int("DRONE_PAD_LIFT_STEP_DELAY_US", 800),
+            step_delay_us=_env_int("DRONE_PAD_LIFT_STEP_DELAY_US", 550),
             timeout_seconds=_env_float("DRONE_PAD_LIFT_TIMEOUT_S", 30.0),
             enable_active_low=_env_bool("DRONE_PAD_LIFT_ENABLE_ACTIVE_LOW", True),
         ),
@@ -285,7 +301,7 @@ def load_settings() -> Settings:
             status_uuid=os.environ.get("DRONE_PAD_DOCK_STATUS_UUID", "8c1c10ea-4536-4a5b-9c37-2f7a3e5c1d2b"),
             device_name=os.environ.get("DRONE_PAD_DOCK_DEVICE_NAME", "DockController"),
             connect_timeout_seconds=_env_float("DRONE_PAD_DOCK_CONNECT_TIMEOUT_S", 10.0),
-            command_timeout_seconds=_env_float("DRONE_PAD_DOCK_COMMAND_TIMEOUT_S", 45.0),
+            command_timeout_seconds=_env_float("DRONE_PAD_DOCK_COMMAND_TIMEOUT_S", 120.0),
         ),
     )
 

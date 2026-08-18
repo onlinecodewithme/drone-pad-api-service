@@ -35,10 +35,12 @@ except ImportError:
     _HAS_BLEAK = False
 
 
-# Status strings that end a DOCK/UNDOCK command (success or failure).
+# Status strings that end a DOCK/UNDOCK command (success or failure). The
+# firmware transitions directly into these stable resting states — there's
+# no separate transient "*_COMPLETE" status that then reverts to idle.
 _TERMINAL_STATUSES = {
-    DockStatus.DOCKING_COMPLETE.value,
-    DockStatus.UNDOCKING_COMPLETE.value,
+    DockStatus.DOCKED.value,
+    DockStatus.UNDOCKED.value,
     DockStatus.ERROR.value,
 }
 
@@ -131,9 +133,27 @@ class DockingController:
             disconnected_callback=self._handle_disconnect,
         )
         try:
-            await client.connect()
+            # BleakClient's own `timeout=` is passed to the underlying
+            # BlueZ/D-Bus backend, which doesn't reliably honor it — a
+            # wedged D-Bus call can leave client.connect() hanging
+            # indefinitely with no exception ever raised. Since
+            # _connection_loop() is a single sequential task, a hang here
+            # doesn't just make one attempt slow — it freezes every future
+            # reconnect attempt too, silently, with no log output, for as
+            # long as the hang lasts. Enforce the timeout from our side so
+            # a stuck attempt always fails and lets the backoff loop retry.
+            await asyncio.wait_for(
+                client.connect(), timeout=self._config.connect_timeout_seconds + 5.0
+            )
             await client.start_notify(self._config.status_uuid, self._on_status_notify)
         except Exception as exc:
+            # Best-effort cleanup of a half-opened client before raising —
+            # otherwise a timed-out attempt can leave a dangling connection
+            # object behind for the next attempt to trip over.
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             raise DockingConnectionError(
                 f"Failed to connect to dock controller at {self._config.device_mac}: {exc}"
             ) from exc
@@ -208,15 +228,15 @@ class DockingController:
     # ----- Commands -----
 
     async def dock(self, timeout: Optional[float] = None) -> DockStatus:
-        """Send DOCK and wait for DOCKING_COMPLETE (or ERROR)."""
+        """Send DOCK and wait for DOCKED (or ERROR)."""
         return await self._execute_command("DOCK", timeout=timeout)
 
     async def undock(self, timeout: Optional[float] = None) -> DockStatus:
-        """Send UNDOCK and wait for UNDOCKING_COMPLETE (or ERROR)."""
+        """Send UNDOCK and wait for UNDOCKED (or ERROR)."""
         return await self._execute_command("UNDOCK", timeout=timeout)
 
     async def reset(self) -> None:
-        """Send RESET — stops all motors and returns the firmware to IDLE."""
+        """Send RESET — stops all motors and re-derives DOCKED/UNDOCKED/UNKNOWN from the limit switches."""
         await self._write_command("RESET")
 
     async def get_status(self) -> DockStatus:
@@ -256,9 +276,11 @@ class DockingController:
                 ) from exc
 
             # Read the status captured at the moment it went terminal, not
-            # self._status — the firmware follows *_COMPLETE with a second
-            # IDLE notification almost immediately, which would otherwise
-            # overwrite it before this coroutine gets scheduled again.
+            # self._status — the firmware's passive rest-state re-verification
+            # can follow DOCKED/UNDOCKED with a near-immediate second
+            # notification (e.g. a momentary UNKNOWN from a switch-read
+            # blip), which would otherwise overwrite it before this
+            # coroutine gets scheduled again.
             result = self._terminal_status
             if result == DockStatus.ERROR:
                 raise DockingError(f"{command} failed — dock controller reported ERROR")

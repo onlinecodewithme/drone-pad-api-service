@@ -373,9 +373,8 @@ async def open_pad():
     Start the pad open sequence.
 
     Sequence: Slide open (NEMA 23) → Lift up (NEMA 17) → UNDOCK over BLE.
-    The pad only reaches OPEN once the docking system confirms
-    UNDOCKING_COMPLETE — UNDOCK is never sent unless lift_upper is
-    confirmed triggered.
+    The pad only reaches OPEN once the docking system confirms UNDOCKED —
+    UNDOCK is never sent unless lift_upper is confirmed triggered.
 
     Self-healing: this can be called from any idle state, including
     ERROR (e.g. after a power cycle whose limit switches hadn't settled
@@ -407,8 +406,8 @@ async def close_pad():
     (NEMA 17) → Slide close (NEMA 23). DOCK is skipped entirely if the
     pad isn't confirmed lifted right now (already closed, or an open
     interrupted before the lift finished) — there's nothing to dock in
-    that case. When DOCK does run, it must complete (DOCKING_COMPLETE)
-    before either motor moves.
+    that case. When DOCK does run, it must complete (DOCKED) before either
+    motor moves.
 
     Self-healing: this can be called from any idle state, including
     ERROR — every stage live-verifies the pad's actual position via its
@@ -571,7 +570,7 @@ async def dock_command():
 
     Runs in the background — this returns immediately once the command is
     sent; poll GET /api/dock/status to watch progress and see the final
-    DOCKING_COMPLETE (or ERROR) status.
+    DOCKED (or ERROR) status.
     """
     controller = _require_docking()
 
@@ -591,7 +590,7 @@ async def undock_command():
 
     Runs in the background — this returns immediately once the command is
     sent; poll GET /api/dock/status to watch progress and see the final
-    UNDOCKING_COMPLETE (or ERROR) status.
+    UNDOCKED (or ERROR) status.
     """
     controller = _require_docking()
 
@@ -606,7 +605,7 @@ async def undock_command():
 
 @app.post("/api/dock/reset", response_model=DockCommandResponse, tags=["docking"])
 async def dock_reset_command():
-    """Send RESET to the dock-lock controller — stops its motors and returns it to IDLE."""
+    """Send RESET to the dock-lock controller — stops its motors and re-verifies DOCKED/UNDOCKED/UNKNOWN from its limit switches."""
     controller = _require_docking()
 
     if not controller.is_connected:

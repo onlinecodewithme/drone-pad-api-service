@@ -36,6 +36,15 @@ _DOCKING_BUSY_STATES = (PadState.UNDOCKING, PadState.DOCKING)
 # before giving up on the cross-thread bridge call itself.
 _DOCKING_BRIDGE_TIMEOUT_BUFFER_S = 15.0
 
+# How long to wait for the docking BLE link to (re)connect on its own before
+# giving up on a DOCK/UNDOCK. DockingController runs an independent
+# reconnect loop with its own backoff (2-30s) in the background — a command
+# issued the instant it's needed can easily land mid-backoff, seconds away
+# from a retry that would have succeeded. Failing instantly there wastes the
+# ~seconds-to-tens-of-seconds of real motor travel that already happened to
+# get here. Bounded so a genuinely dead link still fails in reasonable time.
+_DOCKING_CONNECT_WAIT_S = 20.0
+
 
 # ---------------------------------------------------------------------------
 # Status snapshot
@@ -109,6 +118,9 @@ class PadStateMachine:
         # asyncio.run_coroutine_threadsafe() — see _run_docking_command().
         self._docking = docking
         self._loop = loop
+        # The in-flight docking bridge future, if any — see _run_docking_command()
+        # and emergency_stop().
+        self._docking_future: Optional[concurrent.futures.Future] = None
 
         # State — determined from the limit switches, never assumed. A
         # freshly-restarted process has no memory of what happened before
@@ -213,7 +225,11 @@ class PadStateMachine:
             self._pause_event.set()
             self._is_paused = False
 
-            self._start_sequence(self._open_sequence, "open")
+            if not self._start_sequence(self._open_sequence, "open"):
+                return {
+                    "success": False,
+                    "message": "A previous sequence hasn't fully stopped yet — try again in a moment",
+                }
             return {"success": True, "message": "Open sequence started"}
 
     def close(self) -> dict:
@@ -272,7 +288,11 @@ class PadStateMachine:
                 self._is_paused = False
                 self._error_message = None
 
-                self._start_sequence(self._close_sequence, "close-interrupt")
+                if not self._start_sequence(self._close_sequence, "close-interrupt"):
+                    return {
+                        "success": False,
+                        "message": "A previous sequence hasn't fully stopped yet — try again in a moment",
+                    }
                 return {
                     "success": True,
                     "message": "Open interrupted — close sequence started",
@@ -286,7 +306,11 @@ class PadStateMachine:
             self._pause_event.set()
             self._is_paused = False
 
-            self._start_sequence(self._close_sequence, "close")
+            if not self._start_sequence(self._close_sequence, "close"):
+                return {
+                    "success": False,
+                    "message": "A previous sequence hasn't fully stopped yet — try again in a moment",
+                }
             return {"success": True, "message": "Close sequence started"}
 
     def toggle(self) -> dict:
@@ -353,6 +377,17 @@ class PadStateMachine:
 
             # Immediately kill motors at hardware level
             self._motor.emergency_stop()
+
+            # cancel_event only unblocks a motor stepping loop — a sequence
+            # thread currently blocked in _run_docking_command() waiting on
+            # a DOCK/UNDOCK response never checks it at all, and would
+            # otherwise keep running silently for its own full ~60s timeout
+            # while self._sequence_thread gets overwritten by whatever the
+            # caller starts next. Cancel that future directly so the thread
+            # actually exits before the join below.
+            docking_future = self._docking_future
+            if docking_future is not None:
+                docking_future.cancel()
 
             # Wait for sequence thread
             thread = self._sequence_thread
@@ -436,8 +471,26 @@ class PadStateMachine:
 
     # ----- Private: Sequence orchestration -----
 
-    def _start_sequence(self, target: callable, name: str) -> None:
-        """Launch a sequence function in a background thread."""
+    def _start_sequence(self, target: callable, name: str) -> bool:
+        """
+        Launch a sequence function in a background thread.
+
+        Refuses (returns False) if a previous sequence thread is somehow
+        still alive — this should be structurally impossible given the
+        state guards in open()/close(), but emergency_stop() cancelling a
+        stuck docking wait is what actually makes that guarantee hold in
+        practice (see emergency_stop()'s docking_future.cancel()); this is
+        the last line of defense against ever running two sequences
+        concurrently against the same motors/docking link.
+        """
+        old = self._sequence_thread
+        if old is not None and old.is_alive():
+            logger.error(
+                "Refusing to start '%s' — previous sequence thread '%s' is still running",
+                name, old.name,
+            )
+            return False
+
         self._sequence_thread = threading.Thread(
             target=target,
             name=f"pad-{name}",
@@ -445,6 +498,7 @@ class PadStateMachine:
         )
         self._sequence_thread.start()
         logger.info("Sequence thread '%s' started", name)
+        return True
 
     # ----- Private: Open Sequence -----
 
@@ -466,7 +520,7 @@ class PadStateMachine:
             # multiple samples, not just because run_until_limit() above
             # returned without raising (that alone can be a false-positive
             # "already there" skip if the switch misreports).
-            if not self._confirmed(self._gpio.is_open_limit_triggered):
+            if not self._gpio.confirmed(self._gpio.is_open_limit_triggered):
                 self._handle_error(
                     "Refusing to lift — open_limit switch is not confirmed "
                     "triggered (consistently, across multiple reads) after "
@@ -488,7 +542,7 @@ class PadStateMachine:
             # switch across multiple samples rather than trusting a single
             # read or that stage 2 returning implies we're really lifted;
             # never send UNDOCK otherwise.
-            if not self._confirmed(self._gpio.is_lift_upper_triggered):
+            if not self._gpio.confirmed(self._gpio.is_lift_upper_triggered):
                 self._handle_error(
                     "Refusing to UNDOCK — lift_upper limit switch is not confirmed "
                     "triggered (consistently, across multiple reads) after the lift stage"
@@ -532,7 +586,7 @@ class PadStateMachine:
         lowering/closing, both of which safely no-op if already done.
         """
         try:
-            if self._confirmed(self._gpio.is_lift_upper_triggered):
+            if self._gpio.confirmed(self._gpio.is_lift_upper_triggered):
                 # Stage 1: DOCK over BLE. Must complete before any motor
                 # moves — never lift down or slide close while the drone
                 # isn't confirmed docked/locked.
@@ -580,24 +634,12 @@ class PadStateMachine:
             logger.exception("Unexpected error in close sequence")
 
     # ----- Private: Helpers -----
-
-    # A single instantaneous limit-switch read is not trustworthy enough to
-    # gate an irreversible action (arming a motor, telling the drone dock
-    # to release/lock) — this hardware has a known wiring reliability
-    # issue where switches can briefly, simultaneously misreport. Require
-    # agreement across multiple reads spaced apart in time before trusting
-    # a switch for a safety-critical decision.
-    _CONFIRM_SAMPLES = 3
-    _CONFIRM_INTERVAL_S = 0.15
-
-    def _confirmed(self, check_fn) -> bool:
-        """True only if `check_fn()` reads True on every one of several samples."""
-        for i in range(self._CONFIRM_SAMPLES):
-            if not check_fn():
-                return False
-            if i < self._CONFIRM_SAMPLES - 1:
-                time.sleep(self._CONFIRM_INTERVAL_S)
-        return True
+    #
+    # Multi-sample switch confirmation (self._gpio.confirmed(...), used
+    # throughout this file) now lives on GPIOManager — motor_controller.py's
+    # "already at the limit, skip the move" pre-check needs the exact same
+    # patient confirmation this class's hard gates do, so it's shared in one
+    # place rather than duplicated per caller.
 
     def _infer_physical_state(self) -> Optional[PadState]:
         """
@@ -608,10 +650,10 @@ class PadStateMachine:
         treat that as "unknown" and refuse to guess, never fall back to a
         default.
         """
-        is_open = self._confirmed(self._gpio.is_open_limit_triggered)
-        is_lifted = self._confirmed(self._gpio.is_lift_upper_triggered)
-        is_slide_closed = self._confirmed(self._gpio.is_close_limit_triggered)
-        is_lowered = self._confirmed(self._gpio.is_lift_lower_triggered)
+        is_open = self._gpio.confirmed(self._gpio.is_open_limit_triggered)
+        is_lifted = self._gpio.confirmed(self._gpio.is_lift_upper_triggered)
+        is_slide_closed = self._gpio.confirmed(self._gpio.is_close_limit_triggered)
+        is_lowered = self._gpio.confirmed(self._gpio.is_lift_lower_triggered)
 
         if is_open and is_lifted:
             return PadState.OPEN
@@ -688,7 +730,15 @@ class PadStateMachine:
         if self._loop is None:
             return False, "docking event loop is not available"
         if not self._docking.is_connected:
-            return False, "docking system BLE is not connected"
+            # Give the background reconnect loop a bounded window to land a
+            # retry that's already in flight or imminent, rather than
+            # failing the instant we happen to check — see
+            # _DOCKING_CONNECT_WAIT_S.
+            deadline = time.monotonic() + _DOCKING_CONNECT_WAIT_S
+            while time.monotonic() < deadline and not self._docking.is_connected:
+                time.sleep(0.5)
+            if not self._docking.is_connected:
+                return False, "docking system BLE is not connected"
         return True, "ok"
 
     def _run_docking_command(self, coro_fn, label: str) -> Tuple[bool, str]:
@@ -711,14 +761,28 @@ class PadStateMachine:
 
         timeout = self._settings.docking_config.command_timeout_seconds + _DOCKING_BRIDGE_TIMEOUT_BUFFER_S
         future = asyncio.run_coroutine_threadsafe(coro_fn(), self._loop)
+        # Tracked so emergency_stop() can cancel this specific in-flight call
+        # rather than just setting cancel_event, which this blocking wait
+        # never checks — without this, an emergency-stop mid-DOCK/UNDOCK
+        # left the coroutine running for its own full timeout regardless,
+        # and the next command would queue up behind DockingController's
+        # command lock rather than actually being free to run.
+        with self._lock:
+            self._docking_future = future
         try:
             status = future.result(timeout=timeout)
             return True, f"{label} completed: {status.value}"
         except DockingError as exc:
             return False, str(exc)
+        except concurrent.futures.CancelledError:
+            return False, f"{label} cancelled (emergency stop)"
         except concurrent.futures.TimeoutError:
             future.cancel()
             return False, f"{label} timed out waiting for the BLE bridge call itself"
+        finally:
+            with self._lock:
+                if self._docking_future is future:
+                    self._docking_future = None
 
     def _reset_docking_best_effort(self) -> None:
         """Send RESET to the docking system during emergency_stop(). Never raises."""

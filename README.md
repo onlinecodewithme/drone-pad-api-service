@@ -39,8 +39,8 @@ The dock-lock controller is a physically separate device (firmware at `reference
 
 The ESP32 dock-lock controller docks/undocks the drone itself — separate motors, separate firmware, separate power. The Pi connects to it as a BLE GATT client (`docking_controller.py`) and:
 
-- Auto-connects on service startup and auto-reconnects on any BLE drop (the ESP32 re-advertises on disconnect)
-- Sends `DOCK` / `UNDOCK` / `RESET` commands and tracks progress via BLE notifications (`IDLE`, `UNDOCKING_M1/M2`, `DOCKING_M2/M1/PROP_OPEN/PROP_CLOSE`, `*_COMPLETE`, `ERROR`)
+- Auto-connects on service startup and auto-reconnects on any BLE drop (the ESP32 re-advertises on disconnect), with a bounded connect timeout enforced on the Pi side so a wedged BLE/D-Bus call can't silently freeze all future reconnect attempts (see `docking_controller.py`'s `connect()`)
+- Sends `DOCK` / `UNDOCK` / `RESET` commands and tracks progress via BLE notifications (`UNKNOWN`, `UNDOCKING_M1/M2`, `DOCKING_M2/M1/PROP_OPEN/PROP_CLOSE`, the stable resting states `DOCKED`/`UNDOCKED`, `ERROR`)
 - Is fully integrated into the pad's own open/close sequence (see State Machine below) — you don't call the dock endpoints directly in normal operation, `/api/open` and `/api/close` do it for you at the right moment
 
 `/api/dock/*` endpoints exist for manual testing/debugging the BLE link independent of the pad sequence (see API Reference).
@@ -50,13 +50,13 @@ The ESP32 dock-lock controller docks/undocks the drone itself — separate motor
 ### Open Sequence
 ```
 CLOSED → [NEMA 23 forward → open limit] → [NEMA 17 forward → lift upper limit]
-       → [UNDOCK over BLE → UNDOCKING_COMPLETE] → OPEN
+       → [UNDOCK over BLE → UNDOCKED] → OPEN
 ```
 UNDOCK is only ever sent once `lift_upper` is independently re-confirmed triggered — not just because the previous stage returned.
 
 ### Close Sequence
 ```
-OPEN → [DOCK over BLE → DOCKING_COMPLETE, only if currently lifted]
+OPEN → [DOCK over BLE → DOCKED, only if currently lifted]
      → [NEMA 17 reverse → lift lower limit] → [NEMA 23 reverse → close limit] → CLOSED
 ```
 DOCK is skipped if the pad isn't confirmed lifted right now (e.g. already closed, or an open interrupted before the lift finished) — there's nothing to dock in that case. When DOCK does run, it must complete before either motor moves; if it fails or times out, the pad stays open and reports `ERROR` rather than lifting/closing an undocked drone.
@@ -88,6 +88,7 @@ This system controls physical mechanical hardware with a drone potentially attac
 3. **Self-healing, never a remembered-state guess.** `open()`/`close()` never trust `self._state` to answer "are we already there" — every call live-verifies the pad's actual position via its limit switches and safely no-ops any stage already satisfied. This means the pad recovers from `ERROR` (including a fresh power-cycle before its switches have settled) automatically the moment you call the command you actually want — no manual reset dance required. `reset_from_error()`/`POST /api/reset` still exist for cases where you want to *tell* the software a position without moving any motors (e.g. after manually verifying by hand).
 4. **Emergency-stop reaches both systems.** `POST /api/emergency-stop` disables both pad motors at the hardware level *and* sends `RESET` to the docking controller over BLE, best-effort — "stop everything" means both boards, not just the Pi's own two motors.
 5. **Blocking calls never run on the event loop.** `emergency_stop()`, `close()`'s interrupt path, and the debug jog stop all contain `thread.join()`/`future.result()` — genuinely blocking calls. These are offloaded to a thread pool executor (`_run_blocking()` in `main.py`) rather than called directly from an `async def` handler, which would otherwise freeze the entire event loop — including the very BLE coroutines a blocked call might itself be waiting on.
+6. **BLE connection failures can't silently wedge the reconnect loop.** `DockingController.connect()`'s underlying BlueZ/D-Bus call doesn't reliably honor its own `timeout=`, and a stuck call there previously froze every future reconnect attempt indefinitely, with no error and no log — a real incident where the pad opened and lifted fine (no BLE involved) but then failed `UNDOCK` because the link had been silently dead for hours. `connect()` now enforces the timeout itself via `asyncio.wait_for()`. Separately, `_docking_precheck()` gives an in-flight reconnect a bounded grace window (`_DOCKING_CONNECT_WAIT_S`) before failing a DOCK/UNDOCK outright, since the background reconnect loop's own backoff can otherwise cause a command to fail just seconds before a retry would have landed.
 
 ## Installation
 
@@ -232,14 +233,14 @@ Key parameters:
 |---|---|---|
 | `DRONE_PAD_PORT` | `8000` | API server port |
 | `DRONE_PAD_SIMULATION` | `false` | Run without GPIO hardware |
-| `DRONE_PAD_OPENING_STEP_DELAY_US` | `500` | NEMA 23 step delay (μs) |
-| `DRONE_PAD_LIFT_STEP_DELAY_US` | `800` | NEMA 17 step delay (μs) |
+| `DRONE_PAD_OPENING_STEP_DELAY_US` | `750` | NEMA 23 step delay (μs) |
+| `DRONE_PAD_LIFT_STEP_DELAY_US` | `550` | NEMA 17 step delay (μs) |
 | `DRONE_PAD_OPENING_TIMEOUT_S` | `160.0` | NEMA 23 operation timeout |
 | `DRONE_PAD_LIFT_TIMEOUT_S` | `30.0` | NEMA 17 operation timeout |
 | `DRONE_PAD_SWITCH_DEBOUNCE_MS` | `50` | Limit switch debounce time |
 | `DRONE_PAD_DOCK_MAC` | *(ESP32's BLE MAC)* | Dock controller BLE address |
 | `DRONE_PAD_DOCK_CONNECT_TIMEOUT_S` | `10.0` | BLE connect timeout |
-| `DRONE_PAD_DOCK_COMMAND_TIMEOUT_S` | `45.0` | Max wait for DOCK/UNDOCK to complete |
+| `DRONE_PAD_DOCK_COMMAND_TIMEOUT_S` | `120.0` | Max wait for DOCK/UNDOCK to complete (a full DOCK cycle has been observed taking ~60-90s on real hardware) |
 
 ## Wiring Diagram
 
@@ -303,7 +304,7 @@ python docking_controller.py reset --mac AA:BB:CC:DD:EE:FF -v
 
 ### Firmware
 
-The ESP32 dock-lock controller's firmware lives in its own repository, checked out locally at `reference/drone_dock_locking_system/` (gitignored here — it has its own remote). See that repo for firmware-side changes; `pad_state_machine.py`'s docstrings and this README describe the Pi-side protocol contract it expects (`DOCK`/`UNDOCK`/`RESET` commands, `*_COMPLETE`/`ERROR` terminal statuses).
+The ESP32 dock-lock controller's firmware lives in its own repository, checked out locally at `reference/drone_dock_locking_system/` (gitignored here — it has its own remote). See that repo for firmware-side changes; `pad_state_machine.py`'s docstrings and this README describe the Pi-side protocol contract it expects (`DOCK`/`UNDOCK`/`RESET` commands, `DOCKED`/`UNDOCKED` stable terminal statuses, `ERROR`).
 
 ## License
 

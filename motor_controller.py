@@ -81,8 +81,13 @@ class MotorController:
             motor_id.value, direction.name, config.timeout_seconds,
         )
 
-        # Check if already at the target limit before starting
-        if limit_check():
+        # Check if already at the target limit before starting. Uses a
+        # patient, multi-sample confirmation (not a single instantaneous
+        # read) — this hardware has a known wiring-reliability issue where
+        # a switch can briefly, spuriously misreport as triggered, which
+        # would otherwise skip the motor move entirely on a single glitch
+        # and leave the pad not actually where the caller thinks it is.
+        if self._gpio.confirmed(limit_check):
             logger.info(
                 "Motor %s: limit switch already triggered — skipping",
                 motor_id.value,

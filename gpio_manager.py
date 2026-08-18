@@ -562,6 +562,44 @@ class GPIOManager:
     def is_lift_lower_triggered(self) -> bool:
         return self.read_limit_switch(self._settings.limit_switch_pins.lift_lower)
 
+    def confirmed(
+        self,
+        check_fn: Callable[[], bool],
+        samples: int = 3,
+        interval_s: float = 0.15,
+        patience_s: float = 2.0,
+    ) -> bool:
+        """
+        True once `check_fn()` (typically one of the is_X_triggered methods
+        above) reads True on `samples` *consecutive* calls within
+        `patience_s` total.
+
+        A single instantaneous read — even the debounced ones above — isn't
+        trustworthy enough to gate an irreversible action (arming a motor,
+        skipping a motor move entirely because it's "already there",
+        telling the drone dock to release/lock): this hardware has a known
+        wiring-reliability issue where a switch can briefly, spuriously
+        misreport in either direction. A disagreeing sample only resets the
+        consecutive count here, it doesn't fail immediately — that was
+        tried first and made things worse, since it meant a switch that had
+        genuinely, correctly settled true could still fail an entire
+        open()/close() sequence over one momentary blip. Failing still
+        requires that `samples` consecutive true reads never happen within
+        the whole patience window — a switch stuck genuinely false, or one
+        flickering continuously, correctly still fails.
+        """
+        deadline = time.monotonic() + patience_s
+        consecutive = 0
+        while time.monotonic() < deadline:
+            if check_fn():
+                consecutive += 1
+                if consecutive >= samples:
+                    return True
+            else:
+                consecutive = 0
+            time.sleep(interval_s)
+        return False
+
     def disable_all_motors(self) -> None:
         """Emergency: disable all motor drivers immediately."""
         for motor_id in MotorId:
