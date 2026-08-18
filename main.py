@@ -387,6 +387,7 @@ async def open_pad():
     (POST /api/debug/motor/{motor_id}/jog) is running.
     """
     if debug_motor is not None and debug_motor.get_status().running:
+        logger.warning("open/close rejected — a debug motor jog is in progress")
         return CommandResponse(
             success=False,
             message="A debug motor jog is in progress — stop it first (POST /api/debug/motor/stop)",
@@ -420,6 +421,7 @@ async def close_pad():
     genuinely mid-close already, or a debug axis jog is running.
     """
     if debug_motor is not None and debug_motor.get_status().running:
+        logger.warning("open/close rejected — a debug motor jog is in progress")
         return CommandResponse(
             success=False,
             message="A debug motor jog is in progress — stop it first (POST /api/debug/motor/stop)",

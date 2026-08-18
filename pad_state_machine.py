@@ -205,9 +205,11 @@ class PadStateMachine:
             self._last_command_time = datetime.now(timezone.utc)
 
             if self._state in (PadState.OPENING_SLIDE, PadState.OPENING_LIFT, PadState.UNDOCKING):
+                logger.info("open() no-op — already in progress (state=%s)", self._state.value)
                 return {"success": True, "message": "Open sequence already in progress"}
 
             if self._state in (PadState.DOCKING, PadState.CLOSING_LIFT, PadState.CLOSING_SLIDE):
+                logger.warning("open() rejected — close in progress (state=%s)", self._state.value)
                 return {
                     "success": False,
                     "message": (
@@ -252,9 +254,11 @@ class PadStateMachine:
             self._last_command_time = datetime.now(timezone.utc)
 
             if self._state in (PadState.DOCKING, PadState.CLOSING_LIFT, PadState.CLOSING_SLIDE):
+                logger.info("close() no-op — already in progress (state=%s)", self._state.value)
                 return {"success": True, "message": "Close sequence already in progress"}
 
             if self._state == PadState.UNDOCKING:
+                logger.warning("close() rejected — UNDOCK in progress, cannot interrupt")
                 return {
                     "success": False,
                     "message": (
