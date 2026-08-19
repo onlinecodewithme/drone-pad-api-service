@@ -28,10 +28,11 @@ from config import DockingConfig, DockStatus, Settings
 logger = logging.getLogger(__name__)
 
 try:
-    from bleak import BleakClient
+    from bleak import BleakClient, BleakScanner
     _HAS_BLEAK = True
 except ImportError:
     BleakClient = None  # type: ignore[assignment,misc]
+    BleakScanner = None  # type: ignore[assignment,misc]
     _HAS_BLEAK = False
 
 
@@ -127,12 +128,44 @@ class DockingController:
             "Connecting to dock controller %s (timeout=%.1fs)",
             self._config.device_mac, self._config.connect_timeout_seconds,
         )
-        client = BleakClient(
-            self._config.device_mac,
-            timeout=self._config.connect_timeout_seconds,
-            disconnected_callback=self._handle_disconnect,
-        )
+        client: Optional[BleakClient] = None
         try:
+            # BlueZ only lets you connect-by-address to a device it already
+            # knows about — BleakClient itself does no scanning. Without an
+            # explicit scan here, connect() fails with "Device with address
+            # ... was not found" as soon as BlueZ's own device cache for that
+            # address goes stale, even while the peripheral is actively
+            # advertising right next to us. Resolve a live BLEDevice via a
+            # real scan first, same as any other BLE scanner would.
+            device = await asyncio.wait_for(
+                BleakScanner.find_device_by_address(
+                    self._config.device_mac, timeout=self._config.connect_timeout_seconds
+                ),
+                timeout=self._config.connect_timeout_seconds + 5.0,
+            )
+            if device is None:
+                raise DockingConnectionError(
+                    f"Dock controller {self._config.device_mac} not found during BLE scan"
+                )
+
+            # The MAC alone doesn't guarantee this is actually our firmware —
+            # a chip's BLE MAC only identifies the hardware, not what's
+            # currently flashed onto it (seen firsthand: the same MAC
+            # advertising under a leftover/different firmware's name after
+            # a reflash). Log clearly on a mismatch rather than silently
+            # connecting to whatever answers at that address.
+            if device.name and device.name != self._config.device_name:
+                logger.warning(
+                    "Dock controller at %s is advertising as %r, expected %r — "
+                    "connecting anyway, but this may not be the docking firmware",
+                    self._config.device_mac, device.name, self._config.device_name,
+                )
+
+            client = BleakClient(
+                device,
+                timeout=self._config.connect_timeout_seconds,
+                disconnected_callback=self._handle_disconnect,
+            )
             # BleakClient's own `timeout=` is passed to the underlying
             # BlueZ/D-Bus backend, which doesn't reliably honor it — a
             # wedged D-Bus call can leave client.connect() hanging
@@ -146,20 +179,23 @@ class DockingController:
                 client.connect(), timeout=self._config.connect_timeout_seconds + 5.0
             )
             await client.start_notify(self._config.status_uuid, self._on_status_notify)
+        except DockingConnectionError:
+            raise
         except Exception as exc:
             # Best-effort cleanup of a half-opened client before raising —
             # otherwise a timed-out attempt can leave a dangling connection
             # object behind for the next attempt to trip over.
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
             raise DockingConnectionError(
                 f"Failed to connect to dock controller at {self._config.device_mac}: {exc}"
             ) from exc
 
         self._client = client
-        logger.info("Connected to dock controller")
+        logger.info("Connected to dock controller (advertised name: %r)", device.name)
 
         # Notifications only fire on a state *change*, and the firmware
         # deliberately suppresses the very first one after boot — so seed

@@ -113,7 +113,7 @@ class DockingConfig:
     service_uuid: str
     command_uuid: str            # Write: send DOCK / UNDOCK / RESET / STATUS
     status_uuid: str             # Read + Notify: DockStatus strings
-    device_name: str = "DockController"
+    device_name: str = "ESP_UGV"
     connect_timeout_seconds: float = 10.0
     # Max wait for a *_COMPLETE / ERROR status. A full DOCK cycle
     # (M1 -> M2 -> PROP_OPEN -> PROP_CLOSE) has been observed taking
@@ -299,7 +299,7 @@ def load_settings() -> Settings:
             service_uuid=os.environ.get("DRONE_PAD_DOCK_SERVICE_UUID", "4fafc201-1fb5-459e-8fcc-c5c9c331914b"),
             command_uuid=os.environ.get("DRONE_PAD_DOCK_CMD_UUID", "beb5483e-36e1-4688-b7f5-ea07361b26a8"),
             status_uuid=os.environ.get("DRONE_PAD_DOCK_STATUS_UUID", "8c1c10ea-4536-4a5b-9c37-2f7a3e5c1d2b"),
-            device_name=os.environ.get("DRONE_PAD_DOCK_DEVICE_NAME", "DockController"),
+            device_name=os.environ.get("DRONE_PAD_DOCK_DEVICE_NAME", "ESP_UGV"),
             connect_timeout_seconds=_env_float("DRONE_PAD_DOCK_CONNECT_TIMEOUT_S", 10.0),
             command_timeout_seconds=_env_float("DRONE_PAD_DOCK_COMMAND_TIMEOUT_S", 120.0),
         ),
