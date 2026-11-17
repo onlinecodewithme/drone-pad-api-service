@@ -27,7 +27,7 @@ from docking_controller import DockingController, DockingError
 
 logger = logging.getLogger(__name__)
 
-# States where the pad is communicating with the docking system over BLE.
+# States where the pad is communicating with the docking system over USB serial.
 # Not interruptible (open/close/toggle reject) and not pausable — aborting
 # mid-flight while the dock-lock mechanism is moving is unsafe.
 _DOCKING_BUSY_STATES = (PadState.UNDOCKING, PadState.DOCKING)
@@ -36,7 +36,7 @@ _DOCKING_BUSY_STATES = (PadState.UNDOCKING, PadState.DOCKING)
 # before giving up on the cross-thread bridge call itself.
 _DOCKING_BRIDGE_TIMEOUT_BUFFER_S = 15.0
 
-# How long to wait for the docking BLE link to (re)connect on its own before
+# How long to wait for the docking serial link to (re)connect on its own before
 # giving up on a DOCK/UNDOCK. DockingController runs an independent
 # reconnect loop with its own backoff (2-30s) in the background — a command
 # issued the instant it's needed can easily land mid-backoff, seconds away
@@ -112,7 +112,7 @@ class PadStateMachine:
         self._gpio = gpio
         self._motor = motor
         self._settings = settings
-        # BLE docking integration. `docking`'s coroutines run on `loop` (the
+        # Docking integration (ESP32 over USB serial). `docking`'s coroutines run on `loop` (the
         # FastAPI event loop); this class runs sequences in a plain
         # threading.Thread, so calls into docking are bridged with
         # asyncio.run_coroutine_threadsafe() — see _run_docking_command().
@@ -221,7 +221,7 @@ class PadStateMachine:
             # CLOSED, OPEN, or ERROR — (re)launch. Docking connectivity is
             # checked lazily, only if UNDOCK actually needs to be sent
             # (inside _run_docking_command), not up front — an already-open
-            # pad shouldn't be blocked by an unrelated BLE hiccup.
+            # pad shouldn't be blocked by an unrelated docking-link hiccup.
             self._error_message = None
             self._cancel_event.clear()
             self._pause_event.set()
@@ -403,8 +403,8 @@ class PadStateMachine:
                     self._lock.acquire()
 
             # Best-effort: also stop the docking system's motors. RESET is a
-            # single BLE write (no wait for a terminal status), so this is
-            # fast — but never let a BLE hiccup block the pad's own stop.
+            # single serial write (no wait for a terminal status), so this is
+            # fast — but never let a docking-link hiccup block the pad's own stop.
             self._lock.release()
             try:
                 self._reset_docking_best_effort()
@@ -507,7 +507,7 @@ class PadStateMachine:
     # ----- Private: Open Sequence -----
 
     def _open_sequence(self) -> None:
-        """Full open: slide open → lift up → UNDOCK over BLE."""
+        """Full open: slide open → lift up → UNDOCK over USB serial."""
         try:
             # Stage 1: Slide open (NEMA 23 forward)
             self._transition(PadState.OPENING_SLIDE, MotorId.OPENING)
@@ -542,7 +542,7 @@ class PadStateMachine:
                 pause_event=self._pause_event,
             )
 
-            # Stage 3: UNDOCK over BLE. Hard safety gate — re-check the limit
+            # Stage 3: UNDOCK over USB serial. Hard safety gate — re-check the limit
             # switch across multiple samples rather than trusting a single
             # read or that stage 2 returning implies we're really lifted;
             # never send UNDOCK otherwise.
@@ -578,7 +578,7 @@ class PadStateMachine:
 
     def _close_sequence(self) -> None:
         """
-        Close: DOCK over BLE (only if currently lifted) → lift down → slide close.
+        Close: DOCK over USB serial (only if currently lifted) → lift down → slide close.
 
         Used for every close() call — the normal path from OPEN, recovery
         from ERROR/an unknown starting position, and interrupting an
@@ -591,7 +591,7 @@ class PadStateMachine:
         """
         try:
             if self._gpio.confirmed(self._gpio.is_lift_upper_triggered):
-                # Stage 1: DOCK over BLE. Must complete before any motor
+                # Stage 1: DOCK over USB serial. Must complete before any motor
                 # moves — never lift down or slide close while the drone
                 # isn't confirmed docked/locked.
                 self._transition(PadState.DOCKING, None)
@@ -725,12 +725,12 @@ class PadStateMachine:
         if len(self._event_log) > self._MAX_EVENT_LOG:
             self._event_log = self._event_log[-self._MAX_EVENT_LOG:]
 
-    # ----- Private: Docking (BLE) integration -----
+    # ----- Private: Docking (USB serial) integration -----
 
     def _docking_precheck(self) -> Tuple[bool, str]:
         """Check whether a docking command could even be attempted right now."""
         if self._docking is None:
-            return False, "docking controller is not available (bleak not installed)"
+            return False, "docking controller is not available (pyserial not installed)"
         if self._loop is None:
             return False, "docking event loop is not available"
         if not self._docking.is_connected:
@@ -742,7 +742,7 @@ class PadStateMachine:
             while time.monotonic() < deadline and not self._docking.is_connected:
                 time.sleep(0.5)
             if not self._docking.is_connected:
-                return False, "docking system BLE is not connected"
+                return False, "docking system USB serial link is not connected"
         return True, "ok"
 
     def _run_docking_command(self, coro_fn, label: str) -> Tuple[bool, str]:
@@ -756,7 +756,7 @@ class PadStateMachine:
         raises a warning).
 
         The coroutine itself runs on the real asyncio event loop via
-        run_coroutine_threadsafe(), so the BLE side stays properly async;
+        run_coroutine_threadsafe(), so the serial side stays properly async;
         only this sync thread blocks on the result.
         """
         ok, reason = self._docking_precheck()
@@ -782,7 +782,7 @@ class PadStateMachine:
             return False, f"{label} cancelled (emergency stop)"
         except concurrent.futures.TimeoutError:
             future.cancel()
-            return False, f"{label} timed out waiting for the BLE bridge call itself"
+            return False, f"{label} timed out waiting for the docking bridge call itself"
         finally:
             with self._lock:
                 if self._docking_future is future:

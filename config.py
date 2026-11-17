@@ -26,9 +26,9 @@ class PadState(str, Enum):
     CLOSED = "CLOSED"
     OPENING_SLIDE = "OPENING_SLIDE"
     OPENING_LIFT = "OPENING_LIFT"
-    UNDOCKING = "UNDOCKING"  # Pad physically open, waiting for the BLE UNDOCK to complete
+    UNDOCKING = "UNDOCKING"  # Pad physically open, waiting for the dock controller's UNDOCK to complete
     OPEN = "OPEN"
-    DOCKING = "DOCKING"      # Close requested; waiting for the BLE DOCK to complete before moving
+    DOCKING = "DOCKING"      # Close requested; waiting for the dock controller's DOCK to complete before moving
     CLOSING_LIFT = "CLOSING_LIFT"
     CLOSING_SLIDE = "CLOSING_SLIDE"
     ERROR = "ERROR"
@@ -48,7 +48,7 @@ class Direction(IntEnum):
 
 class DockStatus(str, Enum):
     """
-    Status strings reported by the ESP32 dock-lock controller over BLE.
+    Status strings reported by the ESP32 dock-lock controller over USB serial.
 
     DOCKED/UNDOCKED are the two stable resting states — the firmware
     transitions directly into them (verified against its limit switches,
@@ -66,12 +66,16 @@ class DockStatus(str, Enum):
     DOCKING_M1 = "DOCKING_M1"
     DOCKING_PROP_OPEN = "DOCKING_PROP_OPEN"
     DOCKING_PROP_CLOSE = "DOCKING_PROP_CLOSE"
+    TESTING = "TESTING"      # Bench jog (JOG1/2/3) in progress — firmware is busy
     ERROR = "ERROR"
 
 
 # ---------------------------------------------------------------------------
 # Pin Configuration Dataclasses
 # ---------------------------------------------------------------------------
+
+DEFAULT_DOCK_PORT = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
+
 
 @dataclass(frozen=True)
 class StepperPins:
@@ -108,14 +112,15 @@ class SwitchConfig:
 
 @dataclass(frozen=True)
 class DockingConfig:
-    """Connection parameters for the ESP32 dock-lock controller (BLE)."""
-    device_mac: str              # BLE MAC of the ESP32 (its WiFi MAC + 2)
-    service_uuid: str
-    command_uuid: str            # Write: send DOCK / UNDOCK / RESET / STATUS
-    status_uuid: str             # Read + Notify: DockStatus strings
-    device_name: str = "ESP_UGV"
+    """Connection parameters for the ESP32 dock-lock controller (USB serial)."""
+    # Stable udev name of the ESP32 board's CP2102 USB-UART. If it's missing,
+    # DockingController falls back to the single CP210x device present.
+    port: str = DEFAULT_DOCK_PORT
+    baudrate: int = 115200
+    # Total time connect() keeps asking STATUS before giving up. Covers the
+    # firmware's ~3 s boot delay, during which it ignores serial input.
     connect_timeout_seconds: float = 10.0
-    # Max wait for a *_COMPLETE / ERROR status. A full DOCK cycle
+    # Max wait for DOCKED / UNDOCKED / ERROR. A full DOCK cycle
     # (M1 -> M2 -> PROP_OPEN -> PROP_CLOSE) has been observed taking
     # ~60-90s on real hardware — 45s was set before the propeller-closer
     # motor (M3) was wired up and cut this off mid-cycle. Generous margin
@@ -185,15 +190,8 @@ class Settings:
         )
     )
 
-    # --- Docking System (BLE, ESP32) ---
-    docking_config: DockingConfig = field(
-        default_factory=lambda: DockingConfig(
-            device_mac="70:4B:CA:7B:AF:A2",
-            service_uuid="4fafc201-1fb5-459e-8fcc-c5c9c331914b",
-            command_uuid="beb5483e-36e1-4688-b7f5-ea07361b26a8",
-            status_uuid="8c1c10ea-4536-4a5b-9c37-2f7a3e5c1d2b",
-        )
-    )
+    # --- Docking System (ESP32, USB serial) ---
+    docking_config: DockingConfig = field(default_factory=DockingConfig)
 
     def get_motor_pins(self, motor_id: MotorId) -> StepperPins:
         """Return the pin configuration for a given motor."""
@@ -295,11 +293,8 @@ def load_settings() -> Settings:
             active_low=_env_bool("DRONE_PAD_SWITCH_ACTIVE_LOW", False),
         ),
         docking_config=DockingConfig(
-            device_mac=os.environ.get("DRONE_PAD_DOCK_MAC", "70:4B:CA:7B:AF:A2"),
-            service_uuid=os.environ.get("DRONE_PAD_DOCK_SERVICE_UUID", "4fafc201-1fb5-459e-8fcc-c5c9c331914b"),
-            command_uuid=os.environ.get("DRONE_PAD_DOCK_CMD_UUID", "beb5483e-36e1-4688-b7f5-ea07361b26a8"),
-            status_uuid=os.environ.get("DRONE_PAD_DOCK_STATUS_UUID", "8c1c10ea-4536-4a5b-9c37-2f7a3e5c1d2b"),
-            device_name=os.environ.get("DRONE_PAD_DOCK_DEVICE_NAME", "ESP_UGV"),
+            port=os.environ.get("DRONE_PAD_DOCK_PORT", DEFAULT_DOCK_PORT),
+            baudrate=_env_int("DRONE_PAD_DOCK_BAUD", 115200),
             connect_timeout_seconds=_env_float("DRONE_PAD_DOCK_CONNECT_TIMEOUT_S", 10.0),
             command_timeout_seconds=_env_float("DRONE_PAD_DOCK_COMMAND_TIMEOUT_S", 120.0),
         ),

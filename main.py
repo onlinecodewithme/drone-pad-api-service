@@ -112,11 +112,11 @@ class SimTriggerRequest(BaseModel):
 
 
 class DockStatusResponse(BaseModel):
-    """Status of the BLE connection to the dock-lock (ESP32) controller."""
-    available: bool = Field(..., description="Whether the docking controller could be initialized (bleak installed)")
-    connected: bool = Field(..., description="Whether the BLE link is currently up")
+    """Status of the USB serial link to the dock-lock (ESP32) controller."""
+    available: bool = Field(..., description="Whether the docking controller could be initialized (pyserial installed)")
+    connected: bool = Field(..., description="Whether the USB serial link is currently up")
     status: str = Field(..., description="Last known status reported by the dock controller")
-    device_mac: Optional[str] = Field(None, description="BLE MAC address of the dock controller")
+    port: Optional[str] = Field(None, description="Serial port of the dock controller")
     timestamp: str = Field(..., description="ISO 8601 UTC timestamp of this response")
 
 
@@ -204,7 +204,7 @@ async def lifespan(app: FastAPI):
     motor = MotorController(gpio, settings)
     debug_motor = DebugMotorController(gpio, motor, settings)
 
-    # Docking (BLE) is a separate subsystem — its absence shouldn't stop
+    # Docking (ESP32 over USB serial) is a separate subsystem — its absence shouldn't stop
     # the pad's motors from working standalone, so failures here are
     # logged, not raised. PadStateMachine handles docking=None safely by
     # refusing open()/close() with a clear message (see _docking_precheck).
@@ -213,7 +213,7 @@ async def lifespan(app: FastAPI):
         await docking.start()
         logger.info(
             "Docking controller starting — connecting to %s in the background",
-            settings.docking_config.device_mac,
+            settings.docking_config.port,
         )
     except ImportError as exc:
         logger.warning("Docking controller unavailable: %s", exc)
@@ -311,7 +311,7 @@ async def _run_blocking(fn, *args):
     debug jog stop()) call thread.join()/future.result() internally —
     genuinely blocking calls. Calling them directly from an `async def`
     endpoint blocks the entire event loop for that duration, which is
-    also where DockingController's BLE coroutines run — including any
+    also where DockingController's serial coroutines run — including any
     docking command the blocked method itself schedules via
     run_coroutine_threadsafe(). That's a real deadlock: the scheduled
     coroutine can't run until the blocking call returns, but the blocking
@@ -372,7 +372,7 @@ async def open_pad():
     """
     Start the pad open sequence.
 
-    Sequence: Slide open (NEMA 23) → Lift up (NEMA 17) → UNDOCK over BLE.
+    Sequence: Slide open (NEMA 23) → Lift up (NEMA 17) → UNDOCK over USB serial.
     The pad only reaches OPEN once the docking system confirms UNDOCKED —
     UNDOCK is never sent unless lift_upper is confirmed triggered.
 
@@ -403,7 +403,7 @@ async def close_pad():
     """
     Start the pad close sequence, or interrupt an in-progress open.
 
-    Sequence: DOCK over BLE (only if currently lifted) → Lift down
+    Sequence: DOCK over USB serial (only if currently lifted) → Lift down
     (NEMA 17) → Slide close (NEMA 23). DOCK is skipped entirely if the
     pad isn't confirmed lifted right now (already closed, or an open
     interrupted before the lift finished) — there's nothing to dock in
@@ -526,14 +526,14 @@ async def sim_trigger_switch(req: SimTriggerRequest):
 
 
 # ---------------------------------------------------------------------------
-# Docking Endpoints (BLE, ESP32 dock-lock controller)
+# Docking Endpoints (USB serial, ESP32 dock-lock controller)
 # ---------------------------------------------------------------------------
 
 def _require_docking() -> DockingController:
     if docking is None:
         raise HTTPException(
             status_code=503,
-            detail="Docking controller is not available (bleak not installed on this host)",
+            detail="Docking controller is not available (pyserial not installed on this host)",
         )
     return docking
 
@@ -550,17 +550,17 @@ def _dock_command_response(success: bool, message: str) -> DockCommandResponse:
 @app.get("/api/dock/status", response_model=DockStatusResponse, tags=["docking"])
 async def get_dock_status():
     """
-    Get the current state of the BLE link and the dock-lock controller.
+    Get the current state of the USB serial link and the dock-lock controller.
 
-    `status` reflects the last value reported by the ESP32 over BLE
-    notifications, including in-progress states like DOCKING_M1 or
+    `status` reflects the last value reported by the ESP32 over USB serial
+    (its STATE: lines), including in-progress states like DOCKING_M1 or
     UNDOCKING_PROP_OPEN — poll this while a dock/undock command is running.
     """
     return DockStatusResponse(
         available=docking is not None,
         connected=docking.is_connected if docking is not None else False,
         status=docking.last_status.value if docking is not None else "UNAVAILABLE",
-        device_mac=docking.device_mac if docking is not None else None,
+        port=docking.port if docking is not None else None,
         timestamp=_now_iso(),
     )
 
@@ -660,7 +660,7 @@ async def jog_motor(motor_id: MotorId, req: DebugJogRequest):
     when this is needed most, to manually jog to a known limit before
     POST /api/reset can verify the pad's real position. Rejected during
     an active sequence stage (OPENING_SLIDE, UNDOCKING, etc.), where a
-    real motor move or BLE operation could genuinely be in flight, or if
+    real motor move or docking operation could genuinely be in flight, or if
     another debug jog is already running.
     """
     pad_state = pad.get_status().state

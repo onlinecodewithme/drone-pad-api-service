@@ -1,55 +1,84 @@
 """
-Drone Pad API Service — Docking Controller
+Drone Pad API Service — Docking Controller (USB serial)
 
-Talks to the ESP32 dock-lock controller (see
-https://github.com/onlinecodewithme/drone_dock_locking_system) over BLE.
-Sends DOCK / UNDOCK commands on the command characteristic and tracks
-progress via notifications on the status characteristic until a terminal
-status (*_COMPLETE or ERROR) arrives or the command times out.
+Talks to the ESP32 dock-lock controller (firmware:
+https://github.com/onlinecodewithme/drone_dock_locking_system) over its USB
+serial link (CP2102 USB-UART, 115200 8N1). BLE is no longer used.
 
-This module is intentionally standalone (async, no GPIO/thread coupling)
-so it can be exercised directly against real hardware. Wiring it into
-PadStateMachine is a separate follow-up.
+Line protocol, one '\\n'-terminated line each:
 
-start()/stop() run a persistent auto-reconnect loop as a background
-asyncio task, so callers (e.g. the FastAPI app) can hold one long-lived
-DockingController for the life of the process and always have a
-connection available for commands and status.
+    Pi -> ESP32   DOCK | UNDOCK | RESET | STATUS
+    ESP32 -> Pi   STATE:<state>                  on every state change, and once at boot
+                  [STATUS] State=<state> ...     reply to STATUS
+                  anything else                  human-readable firmware log
+
+A DOCK/UNDOCK finishes when the firmware reaches a stable resting state
+(DOCKED / UNDOCKED) or ERROR. It only counts as success if it ends in the
+state the command was meant to reach.
+
+start()/stop() run a persistent auto-reconnect loop as a background asyncio
+task, so the FastAPI app can hold one long-lived DockingController and always
+have a link available. A dedicated reader thread owns the blocking serial
+reads and hands each line to the event loop.
+
+Opening the port must not reset the ESP32. Its dev board ties EN/GPIO0 to
+RTS/DTR through an auto-reset circuit that only fires when the two lines
+differ. The kernel raises both together on open and drops both together on
+close, and pyserial's defaults (dtr=True, rts=True) leave them that way. Do
+not toggle DTR/RTS individually on this port.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+import os
+import threading
+from typing import List, Optional
 
 from config import DockingConfig, DockStatus, Settings
 
 logger = logging.getLogger(__name__)
 
 try:
-    from bleak import BleakClient, BleakScanner
-    _HAS_BLEAK = True
+    import serial
+    from serial.tools import list_ports
+    _HAS_PYSERIAL = True
 except ImportError:
-    BleakClient = None  # type: ignore[assignment,misc]
-    BleakScanner = None  # type: ignore[assignment,misc]
-    _HAS_BLEAK = False
+    serial = None  # type: ignore[assignment]
+    list_ports = None  # type: ignore[assignment]
+    _HAS_PYSERIAL = False
 
 
-# Status strings that end a DOCK/UNDOCK command (success or failure). The
-# firmware transitions directly into these stable resting states — there's
-# no separate transient "*_COMPLETE" status that then reverts to idle.
-_TERMINAL_STATUSES = {
-    DockStatus.DOCKED.value,
-    DockStatus.UNDOCKED.value,
-    DockStatus.ERROR.value,
+# Stable resting states (plus ERROR) that end a DOCK/UNDOCK command.
+_TERMINAL_STATUSES = {DockStatus.DOCKED, DockStatus.UNDOCKED, DockStatus.ERROR}
+
+# States the firmware is in while it is actually running a sequence.
+_BUSY_STATUSES = {
+    DockStatus.UNDOCKING_M1, DockStatus.UNDOCKING_M2,
+    DockStatus.DOCKING_M2, DockStatus.DOCKING_M1,
+    DockStatus.DOCKING_PROP_OPEN, DockStatus.DOCKING_PROP_CLOSE,
+    DockStatus.TESTING,
 }
 
-# Auto-reconnect backoff (the ESP32 re-advertises on disconnect, so a plain
-# retry loop is enough — no need for anything fancier).
+# USB vendor ID of the CP210x bridge on the ESP32 dev board. Used to find the
+# board if the configured port path doesn't exist.
+_CP210X_VID = 0x10C4
+
+# How long to wait for a reply to STATUS.
+_STATUS_REPLY_TIMEOUT_S = 2.5
+
+# While a DOCK/UNDOCK runs, poll STATUS this often as a backstop in case a
+# STATE: line is missed. It also lets a command that never started fail fast
+# instead of waiting the full command timeout.
+_COMMAND_POLL_INTERVAL_S = 5.0
+
+# Auto-reconnect backoff.
 _MIN_RECONNECT_DELAY_SECONDS = 2.0
 _MAX_RECONNECT_DELAY_SECONDS = 30.0
 _CONNECTION_POLL_SECONDS = 5.0
+
+_BOOT_BANNER = "DOCKING SYSTEM STARTING"
 
 
 class DockingError(Exception):
@@ -63,39 +92,59 @@ class DockingConnectionError(DockingError):
 
 
 class DockingTimeoutError(DockingError):
-    """Raised when no terminal status arrives within the command timeout."""
+    """Raised when no terminal status (or STATUS reply) arrives in time."""
     pass
 
 
 class DockingController:
     """
-    BLE client for the ESP32 dock-lock controller.
+    USB serial client for the ESP32 dock-lock controller.
 
     Usage:
-        async with DockingController(settings) as dock:
+        async with DockingController(settings.docking_config) as dock:
             status = await dock.undock()
     """
 
     def __init__(self, config: DockingConfig) -> None:
-        if not _HAS_BLEAK:
+        if not _HAS_PYSERIAL:
             raise ImportError(
-                "bleak is required for DockingController. Install it with: pip install bleak"
+                "pyserial is required for DockingController. Install it with: pip install pyserial"
             )
         self._config = config
-        self._client: Optional[BleakClient] = None
+        self._serial = None
+        self._port_in_use: Optional[str] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_stop = threading.Event()
+        self._write_lock = threading.Lock()
+
         self._status = DockStatus.UNKNOWN
-        self._terminal_status: Optional[DockStatus] = None
-        self._command_done = asyncio.Event()
+        self._status_waiters: List[asyncio.Future] = []
+
+        # Per-command bookkeeping, only meaningful while _command_lock is held.
         self._command_lock = asyncio.Lock()
+        self._command_done = asyncio.Event()
+        self._command_name: Optional[str] = None
+        self._terminal_status: Optional[DockStatus] = None
+        self._command_error: Optional[str] = None
+        self._seen_busy = False
+
         self._reconnect_task: Optional[asyncio.Task] = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "DockingController":
         return cls(settings.docking_config)
 
+    # ----- Properties -----
+
     @property
     def is_connected(self) -> bool:
-        return self._client is not None and self._client.is_connected
+        return (
+            self._serial is not None
+            and self._serial.is_open
+            and self._reader_thread is not None
+            and self._reader_thread.is_alive()
+        )
 
     @property
     def is_busy(self) -> bool:
@@ -107,8 +156,9 @@ class DockingController:
         return self._status
 
     @property
-    def device_mac(self) -> str:
-        return self._config.device_mac
+    def port(self) -> str:
+        """The serial port in use, or the configured one when not connected."""
+        return self._port_in_use or self._config.port
 
     async def __aenter__(self) -> "DockingController":
         await self.connect()
@@ -119,118 +169,102 @@ class DockingController:
 
     # ----- Connection -----
 
+    def _resolve_port(self) -> Optional[str]:
+        """Configured port if it exists, else the single CP210x device present."""
+        if os.path.exists(self._config.port):
+            return self._config.port
+        candidates = [p.device for p in list_ports.comports() if p.vid == _CP210X_VID]
+        if len(candidates) == 1:
+            logger.warning(
+                "Configured dock port %s not found — using the only CP210x device, %s",
+                self._config.port, candidates[0],
+            )
+            return candidates[0]
+        if len(candidates) > 1:
+            logger.error(
+                "Configured dock port %s not found and %d CP210x devices are present (%s) — "
+                "set DRONE_PAD_DOCK_PORT to pick one",
+                self._config.port, len(candidates), ", ".join(candidates),
+            )
+        return None
+
+    def _open_port(self, port: str):
+        ser = serial.Serial()
+        ser.port = port
+        ser.baudrate = self._config.baudrate
+        ser.timeout = 0.5
+        ser.write_timeout = 1.0
+        # Advisory lock so a second instance of this service can't share the port.
+        ser.exclusive = True
+        # dtr/rts are left at pyserial's defaults (both asserted) on purpose — see
+        # the module docstring. Changing them one at a time would reset the ESP32.
+        ser.open()
+        ser.reset_input_buffer()
+        return ser
+
     async def connect(self) -> None:
-        """Make one connection attempt and subscribe to status notifications."""
+        """Open the serial port and confirm the docking firmware answers STATUS."""
         if self.is_connected:
             return
 
-        logger.info(
-            "Connecting to dock controller %s (timeout=%.1fs)",
-            self._config.device_mac, self._config.connect_timeout_seconds,
-        )
-        client: Optional[BleakClient] = None
+        self._loop = asyncio.get_running_loop()
+        port = self._resolve_port()
+        if port is None:
+            raise DockingConnectionError(f"Dock controller serial port {self._config.port} not found")
+
+        logger.info("Connecting to dock controller on %s @ %d baud", port, self._config.baudrate)
         try:
-            # BlueZ only lets you connect-by-address to a device it already
-            # knows about — BleakClient itself does no scanning. Without an
-            # explicit scan here, connect() fails with "Device with address
-            # ... was not found" as soon as BlueZ's own device cache for that
-            # address goes stale, even while the peripheral is actively
-            # advertising right next to us. Resolve a live BLEDevice via a
-            # real scan first, same as any other BLE scanner would.
-            device = await asyncio.wait_for(
-                BleakScanner.find_device_by_address(
-                    self._config.device_mac, timeout=self._config.connect_timeout_seconds
-                ),
-                timeout=self._config.connect_timeout_seconds + 5.0,
-            )
-            if device is None:
-                raise DockingConnectionError(
-                    f"Dock controller {self._config.device_mac} not found during BLE scan"
-                )
-
-            # The MAC alone doesn't guarantee this is actually our firmware —
-            # a chip's BLE MAC only identifies the hardware, not what's
-            # currently flashed onto it (seen firsthand: the same MAC
-            # advertising under a leftover/different firmware's name after
-            # a reflash). Log clearly on a mismatch rather than silently
-            # connecting to whatever answers at that address.
-            if device.name and device.name != self._config.device_name:
-                logger.warning(
-                    "Dock controller at %s is advertising as %r, expected %r — "
-                    "connecting anyway, but this may not be the docking firmware",
-                    self._config.device_mac, device.name, self._config.device_name,
-                )
-
-            client = BleakClient(
-                device,
-                timeout=self._config.connect_timeout_seconds,
-                disconnected_callback=self._handle_disconnect,
-            )
-            # BleakClient's own `timeout=` is passed to the underlying
-            # BlueZ/D-Bus backend, which doesn't reliably honor it — a
-            # wedged D-Bus call can leave client.connect() hanging
-            # indefinitely with no exception ever raised. Since
-            # _connection_loop() is a single sequential task, a hang here
-            # doesn't just make one attempt slow — it freezes every future
-            # reconnect attempt too, silently, with no log output, for as
-            # long as the hang lasts. Enforce the timeout from our side so
-            # a stuck attempt always fails and lets the backoff loop retry.
-            await asyncio.wait_for(
-                client.connect(), timeout=self._config.connect_timeout_seconds + 5.0
-            )
-            await client.start_notify(self._config.status_uuid, self._on_status_notify)
-        except DockingConnectionError:
-            raise
+            ser = await self._loop.run_in_executor(None, self._open_port, port)
         except Exception as exc:
-            # Best-effort cleanup of a half-opened client before raising —
-            # otherwise a timed-out attempt can leave a dangling connection
-            # object behind for the next attempt to trip over.
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-            raise DockingConnectionError(
-                f"Failed to connect to dock controller at {self._config.device_mac}: {exc}"
-            ) from exc
+            raise DockingConnectionError(f"Failed to open {port}: {exc}") from exc
 
-        self._client = client
-        logger.info("Connected to dock controller (advertised name: %r)", device.name)
+        self._serial = ser
+        self._port_in_use = port
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, args=(ser,), name="dock-serial-reader", daemon=True,
+        )
+        self._reader_thread.start()
 
-        # Notifications only fire on a state *change*, and the firmware
-        # deliberately suppresses the very first one after boot — so seed
-        # our cached status with an active read instead of waiting for a
-        # notify that may never come (e.g. right after boot or RESET).
-        try:
-            self._status = await self.get_status()
-        except DockingConnectionError:
-            pass
+        # Confirm it's actually the docking firmware, and seed the cached status.
+        # Retried across connect_timeout_seconds: if the board happens to be
+        # booting it ignores serial input for ~3 s.
+        deadline = self._loop.time() + self._config.connect_timeout_seconds
+        last_exc: Optional[Exception] = None
+        while self._loop.time() < deadline:
+            try:
+                self._status = await self.get_status()
+                logger.info("Connected to dock controller on %s (status %s)", port, self._status.value)
+                return
+            except DockingError as exc:
+                last_exc = exc
+        await self.disconnect()
+        raise DockingConnectionError(
+            f"No STATUS reply from {port} within {self._config.connect_timeout_seconds:.0f}s — "
+            f"is the docking firmware running? ({last_exc})"
+        )
 
     async def disconnect(self) -> None:
-        """Disconnect from the dock controller, if connected."""
-        if self._client is None:
-            return
-        try:
-            if self._client.is_connected:
-                try:
-                    await self._client.stop_notify(self._config.status_uuid)
-                except Exception:
-                    pass
-                await self._client.disconnect()
-                logger.info("Disconnected from dock controller")
-        finally:
-            self._client = None
-
-    def _handle_disconnect(self, _client: "BleakClient") -> None:
-        """bleak calls this from the event loop on an unexpected BLE drop."""
-        logger.warning("Lost BLE connection to dock controller — will auto-reconnect")
+        """Stop the reader and close the port, if open."""
+        ser, self._serial = self._serial, None
+        self._reader_stop.set()
+        if ser is not None:
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, ser.close)
+            except Exception:
+                pass
+            logger.info("Disconnected from dock controller")
+        thread, self._reader_thread = self._reader_thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._fail_pending("disconnected from dock controller")
 
     async def start(self) -> None:
         """Start the background auto-reconnect loop (call once at app startup)."""
         if self._reconnect_task is not None:
             return
         self._reconnect_task = asyncio.create_task(
-            self._connection_loop(), name="dock-ble-reconnect"
+            self._connection_loop(), name="dock-serial-reconnect"
         )
 
     async def stop(self) -> None:
@@ -245,95 +279,245 @@ class DockingController:
         await self.disconnect()
 
     async def _connection_loop(self) -> None:
-        """Keep the BLE link up for the life of the app, reconnecting on drop."""
+        """Keep the serial link up for the life of the app, reconnecting on loss."""
         delay = _MIN_RECONNECT_DELAY_SECONDS
         while True:
             if not self.is_connected:
                 try:
                     await self.connect()
                     delay = _MIN_RECONNECT_DELAY_SECONDS
-                except DockingConnectionError as exc:
-                    logger.warning(
-                        "Dock controller connect failed: %s — retrying in %.0fs", exc, delay,
-                    )
+                except DockingError as exc:
+                    logger.warning("Dock controller connect failed: %s — retrying in %.0fs", exc, delay)
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, _MAX_RECONNECT_DELAY_SECONDS)
                     continue
             await asyncio.sleep(_CONNECTION_POLL_SECONDS)
 
+    # ----- Reader thread -----
+
+    def _reader_loop(self, ser) -> None:
+        """Blocking serial reads; every complete line goes to the event loop."""
+        while not self._reader_stop.is_set():
+            try:
+                raw = ser.readline()
+            except Exception as exc:  # unplugged, port closed under us, etc.
+                if not self._reader_stop.is_set():
+                    self._post(self._on_link_lost, str(exc))
+                return
+            if not raw:
+                continue
+            text = raw.decode("utf-8", errors="replace").strip()
+            if text:
+                self._post(self._handle_line, text)
+
+    def _post(self, fn, *args) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(fn, *args)
+        except RuntimeError:
+            pass  # loop shutting down
+
+    def _on_link_lost(self, reason: str) -> None:
+        logger.warning("Lost USB serial link to dock controller (%s) — will auto-reconnect", reason)
+        ser, self._serial = self._serial, None
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        self._fail_pending(f"USB serial link to dock controller lost: {reason}")
+
+    def _fail_pending(self, reason: str) -> None:
+        for fut in self._status_waiters:
+            if not fut.done():
+                fut.set_exception(DockingConnectionError(reason))
+        self._status_waiters.clear()
+        if self._command_name is not None and not self._command_done.is_set():
+            self._command_error = reason
+            self._command_done.set()
+
+    # ----- Line handling (event loop thread) -----
+
+    def _handle_line(self, text: str) -> None:
+        if text.startswith("STATE:"):
+            self._on_state(self._parse_status(text[len("STATE:"):]), source="change")
+            return
+
+        if text.startswith("[STATUS] State="):
+            status = self._parse_status(text[len("[STATUS] State="):].split()[0] if
+                                        len(text) > len("[STATUS] State=") else "")
+            logger.debug("Dock STATUS reply: %s", text)
+            self._on_state(status, source="status")
+            waiters, self._status_waiters = self._status_waiters, []
+            for fut in waiters:
+                if not fut.done():
+                    fut.set_result(status)
+            return
+
+        in_command = self._command_name is not None and not self._command_done.is_set()
+
+        if _BOOT_BANNER in text:
+            logger.warning("Dock controller rebooted")
+            if in_command:
+                self._command_error = f"dock controller rebooted during {self._command_name}"
+                self._command_done.set()
+            return
+
+        if in_command and not self._seen_busy and (
+            text.startswith("System busy") or text.startswith("Unknown command")
+        ):
+            self._command_error = f"dock controller rejected {self._command_name}: {text}"
+            self._command_done.set()
+            logger.warning("%s", self._command_error)
+            return
+
+        logger.info("Dock firmware: %s", text)
+
+    def _on_state(self, status: DockStatus, source: str) -> None:
+        if status != self._status or source == "change":
+            logger.info("Dock status: %s", status.value)
+        self._status = status
+
+        if self._command_name is None or self._command_done.is_set():
+            return
+        if status in _BUSY_STATUSES:
+            self._seen_busy = True
+        elif status == DockStatus.ERROR:
+            self._terminal_status = status
+            self._command_done.set()
+        elif status in _TERMINAL_STATUSES and self._seen_busy:
+            # Only after the sequence has visibly started — a resting state
+            # reported before that is the old position, not the result.
+            self._terminal_status = status
+            self._command_done.set()
+
     # ----- Commands -----
 
     async def dock(self, timeout: Optional[float] = None) -> DockStatus:
-        """Send DOCK and wait for DOCKED (or ERROR)."""
-        return await self._execute_command("DOCK", timeout=timeout)
+        """Send DOCK and wait for DOCKED. Raises DockingError on ERROR or any other outcome."""
+        return await self._execute_command("DOCK", DockStatus.DOCKED, timeout=timeout)
 
     async def undock(self, timeout: Optional[float] = None) -> DockStatus:
-        """Send UNDOCK and wait for UNDOCKED (or ERROR)."""
-        return await self._execute_command("UNDOCK", timeout=timeout)
+        """Send UNDOCK and wait for UNDOCKED. Raises DockingError on ERROR or any other outcome."""
+        return await self._execute_command("UNDOCK", DockStatus.UNDOCKED, timeout=timeout)
 
     async def reset(self) -> None:
         """Send RESET — stops all motors and re-derives DOCKED/UNDOCKED/UNKNOWN from the limit switches."""
         await self._write_command("RESET")
 
     async def get_status(self) -> DockStatus:
-        """Read the current status characteristic value directly."""
+        """Ask the firmware for its current state (STATUS) and return the reply."""
         if not self.is_connected:
             raise DockingConnectionError("Not connected to dock controller")
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._status_waiters.append(fut)
         try:
-            raw = await self._client.read_gatt_char(self._config.status_uuid)
-        except Exception as exc:
-            raise DockingConnectionError(f"Failed to read dock status: {exc}") from exc
-        return self._parse_status(raw)
+            await self._write_command("STATUS")
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=_STATUS_REPLY_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise DockingTimeoutError("No reply to STATUS from dock controller") from exc
+        finally:
+            if fut in self._status_waiters:
+                self._status_waiters.remove(fut)
 
     # ----- Internals -----
+
+    def _write_blocking(self, payload: bytes) -> None:
+        ser = self._serial
+        if ser is None:
+            raise DockingConnectionError("Not connected to dock controller")
+        with self._write_lock:
+            ser.write(payload)
+            ser.flush()
 
     async def _write_command(self, command: str) -> None:
         if not self.is_connected:
             raise DockingConnectionError("Not connected to dock controller")
         try:
-            await self._client.write_gatt_char(self._config.command_uuid, command.encode("utf-8"))
+            await asyncio.get_running_loop().run_in_executor(
+                None, self._write_blocking, (command + "\n").encode("ascii")
+            )
+        except DockingError:
+            raise
         except Exception as exc:
             raise DockingConnectionError(f"Failed to send {command}: {exc}") from exc
-        logger.info("Sent %s command", command)
+        if command != "STATUS":
+            logger.info("Sent %s command", command)
 
-    async def _execute_command(self, command: str, timeout: Optional[float]) -> DockStatus:
+    async def _execute_command(self, command: str, expected: DockStatus,
+                               timeout: Optional[float]) -> DockStatus:
         timeout = timeout if timeout is not None else self._config.command_timeout_seconds
+        loop = asyncio.get_running_loop()
 
         async with self._command_lock:
             self._command_done.clear()
             self._terminal_status = None
-            await self._write_command(command)
-
+            self._command_error = None
+            self._seen_busy = False
+            self._command_name = command
             try:
-                await asyncio.wait_for(self._command_done.wait(), timeout=timeout)
-            except asyncio.TimeoutError as exc:
-                raise DockingTimeoutError(
-                    f"No terminal status received within {timeout:.1f}s after {command}"
-                ) from exc
+                await self._write_command(command)
+                deadline = loop.time() + timeout
 
-            # Read the status captured at the moment it went terminal, not
-            # self._status — the firmware's passive rest-state re-verification
-            # can follow DOCKED/UNDOCKED with a near-immediate second
-            # notification (e.g. a momentary UNKNOWN from a switch-read
-            # blip), which would otherwise overwrite it before this
-            # coroutine gets scheduled again.
-            result = self._terminal_status
-            if result == DockStatus.ERROR:
-                raise DockingError(f"{command} failed — dock controller reported ERROR")
+                while not self._command_done.is_set():
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise DockingTimeoutError(
+                            f"No terminal status received within {timeout:.1f}s after {command}"
+                        )
+                    try:
+                        await asyncio.wait_for(
+                            self._command_done.wait(), timeout=min(remaining, _COMMAND_POLL_INTERVAL_S)
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        pass
 
-            return result
+                    # Backstop poll.
+                    try:
+                        polled = await self.get_status()
+                    except DockingTimeoutError:
+                        continue
+                    except DockingConnectionError:
+                        continue  # _fail_pending() will have completed the command
+                    if self._command_done.is_set():
+                        break
+                    if polled in _BUSY_STATUSES:
+                        self._seen_busy = True
+                    elif polled == DockStatus.ERROR or (self._seen_busy and polled in _TERMINAL_STATUSES):
+                        self._terminal_status = polled
+                        break
+                    elif polled == expected:
+                        # Already finished, and its STATE: lines were missed.
+                        self._terminal_status = polled
+                        break
+                    elif not self._seen_busy:
+                        raise DockingError(
+                            f"{command} was not started by the dock controller "
+                            f"(still {polled.value} after {_COMMAND_POLL_INTERVAL_S:.0f}s)"
+                        )
 
-    def _on_status_notify(self, _sender, data: bytearray) -> None:
-        status = self._parse_status(data)
-        self._status = status
-        logger.info("Dock status: %s", status.value)
-        if status.value in _TERMINAL_STATUSES:
-            self._terminal_status = status
-            self._command_done.set()
+                if self._command_error:
+                    raise DockingError(self._command_error)
+
+                result = self._terminal_status
+                if result == DockStatus.ERROR:
+                    raise DockingError(f"{command} failed — dock controller reported ERROR")
+                if result != expected:
+                    raise DockingError(
+                        f"{command} ended in {result.value if result else 'no state'}, "
+                        f"expected {expected.value}"
+                    )
+                return result
+            finally:
+                self._command_name = None
 
     @staticmethod
-    def _parse_status(data: bytes) -> DockStatus:
-        raw = data.decode("utf-8", errors="replace").strip()
+    def _parse_status(raw: str) -> DockStatus:
+        raw = raw.strip()
         try:
             return DockStatus(raw)
         except ValueError:
@@ -351,8 +535,8 @@ async def _cli_main(args) -> int:
 
     settings = load_settings()
     docking_config = settings.docking_config
-    if args.mac:
-        docking_config = replace(docking_config, device_mac=args.mac)
+    if args.port:
+        docking_config = replace(docking_config, port=args.port)
 
     controller = DockingController(docking_config)
     try:
@@ -383,9 +567,9 @@ if __name__ == "__main__":
     import argparse
     import sys
 
-    parser = argparse.ArgumentParser(description="Manually test the BLE dock-lock controller")
+    parser = argparse.ArgumentParser(description="Manually test the USB serial dock-lock controller")
     parser.add_argument("command", choices=["dock", "undock", "status", "reset"])
-    parser.add_argument("--mac", default=None, help="Override the dock controller's BLE MAC address")
+    parser.add_argument("--port", default=None, help="Override the dock controller's serial port")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     cli_args = parser.parse_args()
 
