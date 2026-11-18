@@ -160,6 +160,26 @@ This system controls physical mechanical hardware with a drone potentially attac
 6. **A dead docking link fails fast instead of hanging.** Serial reads run on a dedicated thread; an unplugged cable, a firmware reboot, or a rejected command fails the in-flight DOCK/UNDOCK immediately with a clear message, and the background loop reconnects on its own. (The previous BLE link needed `asyncio.wait_for()` guards because BlueZ/D-Bus calls could hang forever with no error; serial has no equivalent failure mode.) `_docking_precheck()` still gives an in-flight reconnect a bounded grace window (`_DOCKING_CONNECT_WAIT_S`) before failing a DOCK/UNDOCK outright.
 7. **The result must match the request.** An UNDOCK that ends `DOCKED` (or a DOCK that ends `UNDOCKED`) is reported as a failure, never as success.
 
+### Robot E-stop (physical button)
+
+The pad follows the robot's physical E-stop button (Pi GPIO 21, owned by
+`xavier-robot.service`, state served at `http://127.0.0.1:8770/estop`).
+`estop_monitor.py` polls it every 100 ms:
+
+- **Pressed:** the normal emergency stop runs (both drivers disabled, sequence
+  cancelled, debug jog stopped, `RESET` sent to the dock controller) and every
+  motion command is refused with "Robot E-stop is active" until release. Unlike
+  a plain ERROR, `open`/`close` do not self-heal past it.
+- **Released:** the pad resets to OPEN/CLOSED if the limit switches show a
+  definite position; otherwise it stays in ERROR and the next `open`/`close`
+  continues. Nothing moves on release.
+
+`GET /api/status` reports `estop_active` and an `estop` object (hub
+reachability, reason). Settings: `DRONE_PAD_ESTOP_ENABLED`, `DRONE_PAD_ESTOP_URL`,
+`DRONE_PAD_ESTOP_POLL_INTERVAL_S`, `DRONE_PAD_ESTOP_FAIL_SAFE` (see `.env.example`).
+Offline test: `venv/bin/python tests/test_estop.py`. Full description:
+`~/ros2_humble_docker/docs/emergency-stop.md`.
+
 ## Installation
 
 ```bash

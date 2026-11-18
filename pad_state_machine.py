@@ -60,6 +60,7 @@ class PadStatus:
     last_command: Optional[str]
     last_command_time: Optional[str]
     uptime_seconds: float
+    external_estop: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +159,11 @@ class PadStateMachine:
         self._pause_event.set()  # Start in "running" (not paused) state
         self._is_paused = False
 
+        # Robot-wide physical E-stop (see estop_monitor.py). While set, every
+        # motion command is refused — unlike a plain ERROR, which open()/close()
+        # deliberately self-heal from.
+        self._external_estop = False
+
         # Event log
         self._event_log: List[EventEntry] = []
 
@@ -206,7 +212,65 @@ class PadStateMachine:
                     if self._last_command_time else None
                 ),
                 uptime_seconds=round(time.monotonic() - self._start_time, 1),
+                external_estop=self._external_estop,
             )
+
+    @property
+    def external_estop_active(self) -> bool:
+        return self._external_estop
+
+    def _estop_refusal(self, command: str) -> Optional[dict]:
+        """Refusal result while the robot's physical E-stop is pressed, else None. Caller holds the lock."""
+        if not self._external_estop:
+            return None
+        logger.warning("%s() refused — robot E-stop is active", command)
+        return {
+            "success": False,
+            "message": "Robot E-stop is active — release the physical E-stop button first",
+        }
+
+    def set_external_estop(self, active: bool, reason: str = "Physical E-stop pressed") -> dict:
+        """
+        Follow the robot's physical E-stop.
+
+        active=True:  latch, then run the normal emergency_stop() (motors
+                      disabled, sequence cancelled, dock controller RESET).
+                      All motion commands are refused until released.
+        active=False: unlatch and reset from ERROR if the limit switches show a
+                      definite OPEN/CLOSED position. Nothing moves. If the pad
+                      was stopped mid-travel it stays in ERROR, from which
+                      open()/close() continue as usual.
+        """
+        if active:
+            with self._lock:
+                already = self._external_estop
+                self._external_estop = True      # latch first: no new sequence can start
+            result = self.emergency_stop()
+            with self._lock:
+                self._error_message = (
+                    f"{reason} — commands are locked until the E-stop is released"
+                )
+                if not already:
+                    self._log_event("ROBOT_ESTOP_ENGAGED", self._state.value, self._state.value)
+            return result
+
+        with self._lock:
+            if not self._external_estop:
+                return {"success": True, "message": "Robot E-stop was not active"}
+            self._external_estop = False
+            self._log_event("ROBOT_ESTOP_RELEASED", self._state.value, self._state.value)
+            if self._state != PadState.ERROR:
+                return {"success": True, "message": "Robot E-stop released"}
+        result = self.reset_from_error()
+        if not result["success"]:
+            with self._lock:
+                if self._state == PadState.ERROR:
+                    self._error_message = (
+                        "Robot E-stop released, but the pad was stopped between limits — "
+                        "send open or close to continue"
+                    )
+            logger.warning("E-stop released; pad not at a limit, staying in ERROR: %s", result["message"])
+        return result
 
     def get_event_log(self) -> List[EventEntry]:
         """Return a copy of the recent event log."""
@@ -230,6 +294,9 @@ class PadStateMachine:
         Returns a dict with 'success' and 'message' keys.
         """
         with self._lock:
+            refusal = self._estop_refusal("open")
+            if refusal:
+                return refusal
             self._last_command = "open"
             self._last_command_time = datetime.now(timezone.utc)
 
@@ -279,6 +346,9 @@ class PadStateMachine:
         Returns a dict with 'success' and 'message' keys.
         """
         with self._lock:
+            refusal = self._estop_refusal("close")
+            if refusal:
+                return refusal
             self._last_command = "close"
             self._last_command_time = datetime.now(timezone.utc)
 
@@ -353,6 +423,9 @@ class PadStateMachine:
         Returns a dict with 'success' and 'message' keys.
         """
         with self._lock:
+            refusal = self._estop_refusal("toggle")
+            if refusal:
+                return refusal
             self._last_command = "toggle"
             self._last_command_time = datetime.now(timezone.utc)
 
@@ -465,6 +538,9 @@ class PadStateMachine:
         Only allowed when no sequence is running.
         """
         with self._lock:
+            refusal = self._estop_refusal("reset")
+            if refusal:
+                return refusal
             if self._state != PadState.ERROR:
                 return {
                     "success": False,

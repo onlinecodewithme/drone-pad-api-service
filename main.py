@@ -30,6 +30,7 @@ from motor_controller import MotorController
 from pad_state_machine import PadStateMachine, PadStatus, EventEntry
 from docking_controller import DockingController, DockingError
 from debug_controller import DebugMotorController
+from estop_monitor import EStopMonitor
 
 # ---------------------------------------------------------------------------
 # Logging Setup
@@ -80,6 +81,8 @@ class StatusResponse(BaseModel):
     last_command_time: Optional[str] = Field(None, description="Timestamp of last command")
     uptime_seconds: float = Field(..., description="Service uptime in seconds")
     simulation_mode: bool = Field(..., description="Whether running in GPIO simulation mode")
+    estop_active: bool = Field(False, description="True while the robot's physical E-stop is pressed — motion commands are refused")
+    estop: Optional[dict] = Field(None, description="E-stop monitor details (hub reachability, reason)")
     timestamp: str = Field(..., description="ISO 8601 UTC timestamp of this response")
 
 
@@ -90,6 +93,7 @@ class HealthResponse(BaseModel):
     version: str = Field(default="1.0.0", description="Service version")
     simulation_mode: bool = Field(..., description="GPIO simulation mode")
     pad_state: str = Field(..., description="Current pad state")
+    estop_active: bool = Field(False, description="True while the robot's physical E-stop is pressed")
     uptime_seconds: float = Field(..., description="Service uptime in seconds")
     timestamp: str = Field(..., description="ISO 8601 UTC timestamp")
 
@@ -198,6 +202,7 @@ motor: Optional[MotorController] = None
 pad: Optional[PadStateMachine] = None
 docking: Optional[DockingController] = None
 debug_motor: Optional[DebugMotorController] = None
+estop_monitor: Optional[EStopMonitor] = None
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +214,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown lifecycle."""
-    global settings, gpio, motor, pad, docking, debug_motor
+    global settings, gpio, motor, pad, docking, debug_motor, estop_monitor
 
     # --- Startup ---
     settings = load_settings()
@@ -255,6 +260,20 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     pad = PadStateMachine(gpio, motor, settings, docking=docking, loop=loop)
 
+    # Follow the robot's physical E-stop. Its handlers block (thread joins),
+    # so they run on the monitor's own thread, never on the event loop.
+    if settings.estop_enabled:
+        estop_monitor = EStopMonitor(
+            url=settings.estop_url,
+            on_engage=_on_robot_estop_engaged,
+            on_release=_on_robot_estop_released,
+            poll_interval_s=settings.estop_poll_interval_s,
+            fail_safe=settings.estop_fail_safe,
+        )
+        estop_monitor.start()
+    else:
+        logger.warning("Robot E-stop monitoring is DISABLED (DRONE_PAD_ESTOP_ENABLED=false)")
+
     logger.info(
         "Service ready — listening on %s:%d (simulation=%s)",
         settings.host, settings.port, gpio.is_simulation,
@@ -264,6 +283,9 @@ async def lifespan(app: FastAPI):
 
     # --- Shutdown ---
     logger.info("Shutting down — cleaning up resources")
+
+    if estop_monitor is not None:
+        estop_monitor.stop()
 
     if pad is not None:
         try:
@@ -353,6 +375,31 @@ async def _run_blocking(fn, *args):
     return await loop.run_in_executor(None, fn, *args)
 
 
+def _on_robot_estop_engaged(reason: str) -> None:
+    """Robot E-stop pressed: stop any debug jog, then stop and lock the pad."""
+    if debug_motor is not None:
+        try:
+            debug_motor.stop()
+        except Exception:
+            logger.exception("E-stop: stopping the debug jog failed")
+    if pad is not None:
+        pad.set_external_estop(True, reason)
+
+
+def _on_robot_estop_released() -> None:
+    """Robot E-stop released: unlock the pad and reset it if its position is known."""
+    if pad is not None:
+        result = pad.set_external_estop(False)
+        logger.info("E-stop release: %s", result["message"])
+
+
+ESTOP_ACTIVE_MESSAGE = "Robot E-stop is active — release the physical E-stop button first"
+
+
+def _robot_estop_active() -> bool:
+    return pad is not None and pad.external_estop_active
+
+
 def _command_response(result: dict) -> CommandResponse:
     """Build a CommandResponse from a state machine result dict."""
     status = pad.get_status()
@@ -376,6 +423,7 @@ async def health_check():
         status="healthy",
         simulation_mode=gpio.is_simulation,
         pad_state=status.state.value,
+        estop_active=status.external_estop,
         uptime_seconds=status.uptime_seconds,
         timestamp=_now_iso(),
     )
@@ -394,6 +442,8 @@ async def get_status():
         last_command_time=status.last_command_time,
         uptime_seconds=status.uptime_seconds,
         simulation_mode=gpio.is_simulation,
+        estop_active=status.external_estop,
+        estop=estop_monitor.status() if estop_monitor is not None else None,
         timestamp=_now_iso(),
     )
 
@@ -491,6 +541,10 @@ async def emergency_stop():
     All motor drivers are disabled at the hardware level. The pad
     must be reset (POST /api/reset) before normal commands will
     be accepted again. Also cancels any in-progress debug axis jog.
+
+    The robot's physical E-stop button does the same thing automatically
+    and additionally locks every motion command until it is released —
+    see `estop_active` in GET /api/status.
     """
     if debug_motor is not None:
         await _run_blocking(debug_motor.stop)
@@ -616,6 +670,8 @@ async def dock_command():
 
     if not controller.is_connected:
         return _dock_command_response(False, "Not connected to dock controller")
+    if _robot_estop_active():
+        return _dock_command_response(False, ESTOP_ACTIVE_MESSAGE)
     if controller.is_busy:
         return _dock_command_response(False, "A dock/undock command is already in progress")
 
@@ -636,6 +692,8 @@ async def undock_command():
 
     if not controller.is_connected:
         return _dock_command_response(False, "Not connected to dock controller")
+    if _robot_estop_active():
+        return _dock_command_response(False, ESTOP_ACTIVE_MESSAGE)
     if controller.is_busy:
         return _dock_command_response(False, "A dock/undock command is already in progress")
 
@@ -656,6 +714,8 @@ async def propeller_cycle_command():
 
     if not controller.is_connected:
         return _dock_command_response(False, "Not connected to dock controller")
+    if _robot_estop_active():
+        return _dock_command_response(False, ESTOP_ACTIVE_MESSAGE)
     if controller.is_busy:
         return _dock_command_response(False, "A dock command is already in progress")
 
@@ -761,6 +821,9 @@ async def jog_motor(motor_id: MotorId, req: DebugJogRequest):
     real motor move or docking operation could genuinely be in flight, or if
     another debug jog is already running.
     """
+    if _robot_estop_active():
+        return DebugCommandResponse(success=False, message=ESTOP_ACTIVE_MESSAGE, timestamp=_now_iso())
+
     pad_state = pad.get_status().state
     if pad_state not in (PadState.CLOSED, PadState.OPEN, PadState.ERROR):
         return DebugCommandResponse(

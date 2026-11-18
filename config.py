@@ -213,6 +213,18 @@ class Settings:
     # Startup default for the dock mode. A mode chosen at runtime through
     # PUT /api/dock/mode is saved to dock_mode_file and takes precedence.
     dock_mode: DockMode = DockMode.PROPELLER_ONLY
+
+    # --- Robot E-stop (physical button, served by the robot control system) ---
+    # The pad follows the robot's physical emergency stop: it stops and locks
+    # while the button is pressed and resets when it is released. See
+    # estop_monitor.py.
+    estop_enabled: bool = True
+    estop_url: str = "http://127.0.0.1:8770/estop"
+    estop_poll_interval_s: float = 0.1
+    # True: an unreachable E-stop hub counts as a pressed E-stop.
+    # False: keep the last known state and only log a warning.
+    estop_fail_safe: bool = False
+
     dock_mode_file: str = field(
         default_factory=lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "dock_mode.json")
     )
@@ -385,6 +397,10 @@ def load_settings() -> Settings:
             command_timeout_seconds=_env_float("DRONE_PAD_DOCK_COMMAND_TIMEOUT_S", 120.0),
         ),
         dock_mode=_env_dock_mode("DRONE_PAD_DOCK_MODE", DockMode.PROPELLER_ONLY),
+        estop_enabled=_env_bool("DRONE_PAD_ESTOP_ENABLED", True),
+        estop_url=os.environ.get("DRONE_PAD_ESTOP_URL", "http://127.0.0.1:8770/estop"),
+        estop_poll_interval_s=_env_float("DRONE_PAD_ESTOP_POLL_INTERVAL_S", 0.1),
+        estop_fail_safe=_env_bool("DRONE_PAD_ESTOP_FAIL_SAFE", False),
     )
     settings.dock_mode_file = os.environ.get("DRONE_PAD_DOCK_MODE_FILE", settings.dock_mode_file)
 
