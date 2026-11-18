@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 
-from config import PadState, MotorId, Direction, Settings
+from config import PadState, MotorId, Direction, Settings, DockMode
 from gpio_manager import GPIOManager
 from motor_controller import (
     MotorController,
@@ -161,7 +161,36 @@ class PadStateMachine:
         # Event log
         self._event_log: List[EventEntry] = []
 
+        # What open/close ask of the dock controller — see config.DockMode.
+        # Each sequence reads this once when it starts, so changing it can
+        # never alter a sequence that's already running.
+        self._dock_mode: DockMode = settings.dock_mode
+        logger.info("Dock mode: %s", self._dock_mode.value)
+
     # ----- Public API -----
+
+    @property
+    def dock_mode(self) -> DockMode:
+        return self._dock_mode
+
+    def set_dock_mode(self, mode: DockMode) -> Tuple[bool, str]:
+        """
+        Switch between PROPELLER_ONLY and FULL. Refused while a pad sequence
+        or a dock command is running, so a sequence never changes mode halfway.
+        """
+        with self._lock:
+            thread = self._sequence_thread
+            if thread is not None and thread.is_alive():
+                return False, f"Cannot change dock mode while a sequence is running (state {self._state.value})"
+            if self._docking is not None and self._docking.is_busy:
+                return False, "Cannot change dock mode while a dock command is running"
+            old = self._dock_mode
+            if old == mode:
+                return True, f"Dock mode is already {mode.value}"
+            self._dock_mode = mode
+            self._log_event(f"DOCK_MODE:{old.value}->{mode.value}", self._state.value, self._state.value)
+        logger.info("Dock mode changed: %s -> %s", old.value, mode.value)
+        return True, f"Dock mode changed from {old.value} to {mode.value}"
 
     def get_status(self) -> PadStatus:
         """Return a snapshot of the current pad status."""
@@ -507,7 +536,13 @@ class PadStateMachine:
     # ----- Private: Open Sequence -----
 
     def _open_sequence(self) -> None:
-        """Full open: slide open → lift up → UNDOCK over USB serial."""
+        """
+        Open: slide open → lift up, then in FULL dock mode also UNDOCK over USB serial.
+
+        In PROPELLER_ONLY mode the docking motors are never used, so the
+        sequence ends at OPEN once the lift is confirmed up.
+        """
+        mode = self._dock_mode  # fixed for the whole sequence
         try:
             # Stage 1: Slide open (NEMA 23 forward)
             self._transition(PadState.OPENING_SLIDE, MotorId.OPENING)
@@ -542,16 +577,25 @@ class PadStateMachine:
                 pause_event=self._pause_event,
             )
 
-            # Stage 3: UNDOCK over USB serial. Hard safety gate — re-check the limit
-            # switch across multiple samples rather than trusting a single
-            # read or that stage 2 returning implies we're really lifted;
-            # never send UNDOCK otherwise.
+            # Hard safety gate — re-check the lift limit switch across multiple
+            # samples rather than trusting a single read or that stage 2
+            # returning implies we're really lifted. Never report OPEN or send
+            # UNDOCK otherwise.
             if not self._gpio.confirmed(self._gpio.is_lift_upper_triggered):
                 self._handle_error(
-                    "Refusing to UNDOCK — lift_upper limit switch is not confirmed "
-                    "triggered (consistently, across multiple reads) after the lift stage"
+                    ("Refusing to UNDOCK" if mode == DockMode.FULL else "Refusing to report OPEN")
+                    + " — lift_upper limit switch is not confirmed triggered "
+                    "(consistently, across multiple reads) after the lift stage"
                 )
                 return
+
+            if mode == DockMode.PROPELLER_ONLY:
+                # Docking motors disabled: nothing to release. Done.
+                self._transition(PadState.OPEN, None)
+                logger.info("Open sequence completed successfully (dock mode propeller_only: no UNDOCK)")
+                return
+
+            # Stage 3 (FULL mode only): UNDOCK over USB serial.
 
             self._transition(PadState.UNDOCKING, None)
             ok, message = self._run_docking_command(
@@ -578,7 +622,12 @@ class PadStateMachine:
 
     def _close_sequence(self) -> None:
         """
-        Close: DOCK over USB serial (only if currently lifted) → lift down → slide close.
+        Close: dock step (only if currently lifted) → lift down → slide close.
+
+        The dock step depends on the dock mode, read once at the start:
+          FULL            DOCK: M2 → M1 → propeller open → propeller close
+          PROPELLER_ONLY  PROPCYCLE: propeller open → propeller close only;
+                          the docking motors M1/M2 never move
 
         Used for every close() call — the normal path from OPEN, recovery
         from ERROR/an unknown starting position, and interrupting an
@@ -589,20 +638,31 @@ class PadStateMachine:
         never released, so there's nothing to dock — skip straight to
         lowering/closing, both of which safely no-op if already done.
         """
+        mode = self._dock_mode  # fixed for the whole sequence
         try:
             if self._gpio.confirmed(self._gpio.is_lift_upper_triggered):
-                # Stage 1: DOCK over USB serial. Must complete before any motor
-                # moves — never lift down or slide close while the drone
-                # isn't confirmed docked/locked.
+                # Stage 1: dock step over USB serial. Must complete before any
+                # motor moves — never lift down or slide close until it has.
+                # PadState.DOCKING covers both modes' dock step.
                 self._transition(PadState.DOCKING, None)
-                ok, message = self._run_docking_command(
-                    lambda: self._docking.dock(), "DOCK"
-                )
-                if not ok:
-                    self._handle_error(f"DOCK failed — pad remains open, not closing: {message}")
-                    return
+                if mode == DockMode.PROPELLER_ONLY:
+                    ok, message = self._run_docking_command(
+                        lambda: self._docking.propeller_cycle(), "PROPCYCLE"
+                    )
+                    if not ok:
+                        self._handle_error(
+                            f"Propeller closer cycle failed — pad remains open, not closing: {message}"
+                        )
+                        return
+                else:
+                    ok, message = self._run_docking_command(
+                        lambda: self._docking.dock(), "DOCK"
+                    )
+                    if not ok:
+                        self._handle_error(f"DOCK failed — pad remains open, not closing: {message}")
+                        return
             else:
-                logger.info("Not lifted — skipping DOCK, closing directly")
+                logger.info("Not lifted — skipping the dock step (%s), closing directly", mode.value)
 
             # Stage 2: Lift down (NEMA 17 reverse)
             self._transition(PadState.CLOSING_LIFT, MotorId.LIFT)

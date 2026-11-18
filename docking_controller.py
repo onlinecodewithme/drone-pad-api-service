@@ -7,7 +7,7 @@ serial link (CP2102 USB-UART, 115200 8N1). BLE is no longer used.
 
 Line protocol, one '\\n'-terminated line each:
 
-    Pi -> ESP32   DOCK | UNDOCK | RESET | STATUS
+    Pi -> ESP32   DOCK | UNDOCK | PROPCYCLE | RESET | STATUS
     ESP32 -> Pi   STATE:<state>                  on every state change, and once at boot
                   [STATUS] State=<state> ...     reply to STATUS
                   anything else                  human-readable firmware log
@@ -15,6 +15,11 @@ Line protocol, one '\\n'-terminated line each:
 A DOCK/UNDOCK finishes when the firmware reaches a stable resting state
 (DOCKED / UNDOCKED) or ERROR. It only counts as success if it ends in the
 state the command was meant to reach.
+
+PROPCYCLE runs only the propeller closer (open, then close) and never moves
+the docking motors M1/M2, so it can end in DOCKED, UNDOCKED or UNKNOWN. It
+counts as success only if a STATUS read afterwards shows the propeller
+closer's close limit switch triggered.
 
 start()/stop() run a persistent auto-reconnect loop as a background asyncio
 task, so the FastAPI app can hold one long-lived DockingController and always
@@ -34,7 +39,7 @@ import asyncio
 import logging
 import os
 import threading
-from typing import List, Optional
+from typing import Awaitable, Callable, Dict, FrozenSet, List, Optional
 
 from config import DockingConfig, DockStatus, Settings
 
@@ -58,8 +63,14 @@ _BUSY_STATUSES = {
     DockStatus.UNDOCKING_M1, DockStatus.UNDOCKING_M2,
     DockStatus.DOCKING_M2, DockStatus.DOCKING_M1,
     DockStatus.DOCKING_PROP_OPEN, DockStatus.DOCKING_PROP_CLOSE,
+    DockStatus.PROP_CYCLE_OPEN, DockStatus.PROP_CYCLE_CLOSE,
     DockStatus.TESTING,
 }
+
+# PROPCYCLE leaves M1/M2 wherever they are, so any resting state ends it.
+_PROP_CYCLE_TERMINALS = frozenset(
+    {DockStatus.DOCKED, DockStatus.UNDOCKED, DockStatus.UNKNOWN, DockStatus.ERROR}
+)
 
 # USB vendor ID of the CP210x bridge on the ESP32 dev board. Used to find the
 # board if the configured port path doesn't exist.
@@ -120,6 +131,8 @@ class DockingController:
 
         self._status = DockStatus.UNKNOWN
         self._status_waiters: List[asyncio.Future] = []
+        # Limit switch readings from the last STATUS reply, e.g. {"Prop_close": "HIT"}.
+        self._last_switches: Dict[str, str] = {}
 
         # Per-command bookkeeping, only meaningful while _command_lock is held.
         self._command_lock = asyncio.Lock()
@@ -128,6 +141,8 @@ class DockingController:
         self._terminal_status: Optional[DockStatus] = None
         self._command_error: Optional[str] = None
         self._seen_busy = False
+        self._command_terminals: FrozenSet[DockStatus] = frozenset(_TERMINAL_STATUSES)
+        self._prop_cycle_completed = False
 
         self._reconnect_task: Optional[asyncio.Task] = None
 
@@ -154,6 +169,11 @@ class DockingController:
     @property
     def last_status(self) -> DockStatus:
         return self._status
+
+    @property
+    def last_switches(self) -> Dict[str, str]:
+        """Limit switch readings from the most recent STATUS reply."""
+        return dict(self._last_switches)
 
     @property
     def port(self) -> str:
@@ -349,6 +369,9 @@ class DockingController:
             status = self._parse_status(text[len("[STATUS] State="):].split()[0] if
                                         len(text) > len("[STATUS] State=") else "")
             logger.debug("Dock STATUS reply: %s", text)
+            self._last_switches = dict(
+                tok.split("=", 1) for tok in text.split()[2:] if "=" in tok
+            )
             self._on_state(status, source="status")
             waiters, self._status_waiters = self._status_waiters, []
             for fut in waiters:
@@ -363,6 +386,11 @@ class DockingController:
             if in_command:
                 self._command_error = f"dock controller rebooted during {self._command_name}"
                 self._command_done.set()
+            return
+
+        if text.startswith("PROP_CYCLE_COMPLETE") and in_command and self._command_name == "PROPCYCLE":
+            self._prop_cycle_completed = True
+            logger.info("Dock firmware: %s", text)
             return
 
         if in_command and not self._seen_busy and (
@@ -387,7 +415,7 @@ class DockingController:
         elif status == DockStatus.ERROR:
             self._terminal_status = status
             self._command_done.set()
-        elif status in _TERMINAL_STATUSES and self._seen_busy:
+        elif status in self._command_terminals and (self._seen_busy or self._prop_cycle_completed):
             # Only after the sequence has visibly started — a resting state
             # reported before that is the old position, not the result.
             self._terminal_status = status
@@ -402,6 +430,28 @@ class DockingController:
     async def undock(self, timeout: Optional[float] = None) -> DockStatus:
         """Send UNDOCK and wait for UNDOCKED. Raises DockingError on ERROR or any other outcome."""
         return await self._execute_command("UNDOCK", DockStatus.UNDOCKED, timeout=timeout)
+
+    async def propeller_cycle(self, timeout: Optional[float] = None) -> DockStatus:
+        """
+        Send PROPCYCLE: propeller closer open -> close, docking motors untouched.
+
+        Returns the resting state the firmware reports afterwards (DOCKED,
+        UNDOCKED or UNKNOWN — M1/M2 weren't moved). Raises DockingError on
+        ERROR, or if the propeller closer's close limit isn't confirmed
+        triggered by a STATUS read at the end.
+        """
+        async def verify_closed() -> None:
+            await self.get_status()
+            if self._last_switches.get("Prop_close") != "HIT":
+                raise DockingError(
+                    "propeller cycle finished but the propeller closer's close limit "
+                    f"is not triggered (switches: {self._last_switches or 'unknown'})"
+                )
+
+        return await self._execute_command(
+            "PROPCYCLE", None, timeout=timeout,
+            terminals=_PROP_CYCLE_TERMINALS, verify=verify_closed,
+        )
 
     async def reset(self) -> None:
         """Send RESET — stops all motors and re-derives DOCKED/UNDOCKED/UNKNOWN from the limit switches."""
@@ -447,8 +497,21 @@ class DockingController:
         if command != "STATUS":
             logger.info("Sent %s command", command)
 
-    async def _execute_command(self, command: str, expected: DockStatus,
-                               timeout: Optional[float]) -> DockStatus:
+    async def _execute_command(
+        self,
+        command: str,
+        expected: Optional[DockStatus],
+        timeout: Optional[float],
+        terminals: FrozenSet[DockStatus] = frozenset(_TERMINAL_STATUSES),
+        verify: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> DockStatus:
+        """
+        Send `command` and wait for it to finish.
+
+        `expected` is the resting state that counts as success (DOCK/UNDOCK),
+        or None when any state in `terminals` other than ERROR is acceptable
+        (PROPCYCLE), in which case `verify` decides success.
+        """
         timeout = timeout if timeout is not None else self._config.command_timeout_seconds
         loop = asyncio.get_running_loop()
 
@@ -457,6 +520,8 @@ class DockingController:
             self._terminal_status = None
             self._command_error = None
             self._seen_busy = False
+            self._prop_cycle_completed = False
+            self._command_terminals = frozenset(terminals)
             self._command_name = command
             try:
                 await self._write_command(command)
@@ -485,16 +550,17 @@ class DockingController:
                         continue  # _fail_pending() will have completed the command
                     if self._command_done.is_set():
                         break
+                    started = self._seen_busy or self._prop_cycle_completed
                     if polled in _BUSY_STATUSES:
                         self._seen_busy = True
-                    elif polled == DockStatus.ERROR or (self._seen_busy and polled in _TERMINAL_STATUSES):
+                    elif polled == DockStatus.ERROR or (started and polled in terminals):
                         self._terminal_status = polled
                         break
-                    elif polled == expected:
+                    elif expected is not None and polled == expected:
                         # Already finished, and its STATE: lines were missed.
                         self._terminal_status = polled
                         break
-                    elif not self._seen_busy:
+                    elif not started:
                         raise DockingError(
                             f"{command} was not started by the dock controller "
                             f"(still {polled.value} after {_COMMAND_POLL_INTERVAL_S:.0f}s)"
@@ -506,11 +572,14 @@ class DockingController:
                 result = self._terminal_status
                 if result == DockStatus.ERROR:
                     raise DockingError(f"{command} failed — dock controller reported ERROR")
-                if result != expected:
+                if result is None:
+                    raise DockingError(f"{command} ended without a final state")
+                if expected is not None and result != expected:
                     raise DockingError(
-                        f"{command} ended in {result.value if result else 'no state'}, "
-                        f"expected {expected.value}"
+                        f"{command} ended in {result.value}, expected {expected.value}"
                     )
+                if verify is not None:
+                    await verify()
                 return result
             finally:
                 self._command_name = None
@@ -551,6 +620,9 @@ async def _cli_main(args) -> int:
         elif args.command == "undock":
             status = await controller.undock()
             print(f"Undock result: {status.value}")
+        elif args.command == "propcycle":
+            status = await controller.propeller_cycle()
+            print(f"Propeller cycle result: {status.value} (switches: {controller.last_switches})")
         elif args.command == "reset":
             await controller.reset()
             print("RESET sent")
@@ -568,7 +640,7 @@ if __name__ == "__main__":
     import sys
 
     parser = argparse.ArgumentParser(description="Manually test the USB serial dock-lock controller")
-    parser.add_argument("command", choices=["dock", "undock", "status", "reset"])
+    parser.add_argument("command", choices=["dock", "undock", "propcycle", "status", "reset"])
     parser.add_argument("--port", default=None, help="Override the dock controller's serial port")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     cli_args = parser.parse_args()

@@ -21,7 +21,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from config import Direction, MotorId, PadState, load_settings, Settings
+from config import (
+    Direction, DockMode, MotorId, PadState, Settings,
+    load_saved_dock_mode, load_settings, save_dock_mode,
+)
 from gpio_manager import GPIOManager
 from motor_controller import MotorController
 from pad_state_machine import PadStateMachine, PadStatus, EventEntry
@@ -117,7 +120,25 @@ class DockStatusResponse(BaseModel):
     connected: bool = Field(..., description="Whether the USB serial link is currently up")
     status: str = Field(..., description="Last known status reported by the dock controller")
     port: Optional[str] = Field(None, description="Serial port of the dock controller")
+    mode: str = Field(..., description="Dock mode: propeller_only (docking motors disabled) or full")
     timestamp: str = Field(..., description="ISO 8601 UTC timestamp of this response")
+
+
+class DockModeRequest(BaseModel):
+    """Body for PUT /api/dock/mode."""
+    mode: Literal["propeller_only", "full"] = Field(
+        ..., description="propeller_only: open = slide + lift, close = propeller cycle + lower + slide. "
+                         "full: the original UNDOCK/DOCK sequences."
+    )
+
+
+class DockModeResponse(BaseModel):
+    """Current dock mode, and the result of changing it."""
+    success: bool = Field(..., description="Whether the request was applied")
+    message: str = Field(..., description="Human-readable result message")
+    mode: str = Field(..., description="Dock mode now in effect")
+    saved: bool = Field(..., description="Whether the mode is saved and will survive a restart")
+    timestamp: str = Field(..., description="ISO 8601 timestamp")
 
 
 class DockCommandResponse(BaseModel):
@@ -203,6 +224,16 @@ async def lifespan(app: FastAPI):
 
     motor = MotorController(gpio, settings)
     debug_motor = DebugMotorController(gpio, motor, settings)
+
+    # Dock mode: a mode saved through PUT /api/dock/mode wins over the
+    # DRONE_PAD_DOCK_MODE startup default.
+    saved_mode = load_saved_dock_mode(settings.dock_mode_file)
+    if saved_mode is not None:
+        settings.dock_mode = saved_mode
+    logger.info(
+        "Dock mode: %s (%s)", settings.dock_mode.value,
+        f"saved in {settings.dock_mode_file}" if saved_mode is not None else "startup default",
+    )
 
     # Docking (ESP32 over USB serial) is a separate subsystem — its absence shouldn't stop
     # the pad's motors from working standalone, so failures here are
@@ -372,9 +403,11 @@ async def open_pad():
     """
     Start the pad open sequence.
 
-    Sequence: Slide open (NEMA 23) → Lift up (NEMA 17) → UNDOCK over USB serial.
-    The pad only reaches OPEN once the docking system confirms UNDOCKED —
-    UNDOCK is never sent unless lift_upper is confirmed triggered.
+    Sequence depends on the dock mode (GET/PUT /api/dock/mode):
+      propeller_only (default): Slide open (NEMA 23) → Lift up (NEMA 17). Done.
+      full: Slide open → Lift up → UNDOCK over USB serial. The pad only
+        reaches OPEN once the docking system confirms UNDOCKED — UNDOCK is
+        never sent unless lift_upper is confirmed triggered.
 
     Self-healing: this can be called from any idle state, including
     ERROR (e.g. after a power cycle whose limit switches hadn't settled
@@ -403,12 +436,15 @@ async def close_pad():
     """
     Start the pad close sequence, or interrupt an in-progress open.
 
-    Sequence: DOCK over USB serial (only if currently lifted) → Lift down
-    (NEMA 17) → Slide close (NEMA 23). DOCK is skipped entirely if the
-    pad isn't confirmed lifted right now (already closed, or an open
-    interrupted before the lift finished) — there's nothing to dock in
-    that case. When DOCK does run, it must complete (DOCKED) before either
-    motor moves.
+    Sequence: dock step (only if currently lifted) → Lift down (NEMA 17)
+    → Slide close (NEMA 23). The dock step depends on the dock mode:
+      propeller_only (default): propeller closer cycle (open → close); the
+        docking motors never move. Must end with the propeller closer's
+        close limit triggered.
+      full: DOCK (M2 → M1 → propeller open → close). Must end DOCKED.
+    The dock step is skipped if the pad isn't confirmed lifted right now
+    (already closed, or an open interrupted before the lift finished).
+    When it runs, it must succeed before either pad motor moves.
 
     Self-healing: this can be called from any idle state, including
     ERROR — every stage live-verifies the pad's actual position via its
@@ -416,7 +452,7 @@ async def close_pad():
     resolves in under a second, or drives whatever's left to a known
     limit. No manual reset required.
 
-    Interrupting mid-UNDOCK/DOCK is rejected — wait for it to finish or
+    Interrupting mid-UNDOCK/dock step is rejected — wait for it to finish or
     issue emergency-stop. Returns success=false only if the pad is
     genuinely mid-close already, or a debug axis jog is running.
     """
@@ -561,6 +597,8 @@ async def get_dock_status():
         connected=docking.is_connected if docking is not None else False,
         status=docking.last_status.value if docking is not None else "UNAVAILABLE",
         port=docking.port if docking is not None else None,
+        mode=(pad.dock_mode.value if pad is not None
+              else settings.dock_mode.value if settings is not None else "unknown"),
         timestamp=_now_iso(),
     )
 
@@ -603,6 +641,66 @@ async def undock_command():
 
     asyncio.create_task(_run_dock_command(controller.undock, "UNDOCK"))
     return _dock_command_response(True, "Undock sequence started")
+
+
+@app.post("/api/dock/propeller-cycle", response_model=DockCommandResponse, tags=["docking"])
+async def propeller_cycle_command():
+    """
+    Run only the propeller closer (open, then close) on the dock controller.
+    The docking motors M1/M2 do not move.
+
+    This is the dock step the close sequence uses in propeller_only mode.
+    Runs in the background — poll GET /api/dock/status to watch progress.
+    """
+    controller = _require_docking()
+
+    if not controller.is_connected:
+        return _dock_command_response(False, "Not connected to dock controller")
+    if controller.is_busy:
+        return _dock_command_response(False, "A dock command is already in progress")
+
+    asyncio.create_task(_run_dock_command(controller.propeller_cycle, "PROPCYCLE"))
+    return _dock_command_response(True, "Propeller closer cycle started")
+
+
+def _dock_mode_response(success: bool, message: str) -> DockModeResponse:
+    return DockModeResponse(
+        success=success,
+        message=message,
+        mode=pad.dock_mode.value,
+        saved=load_saved_dock_mode(settings.dock_mode_file) == pad.dock_mode,
+        timestamp=_now_iso(),
+    )
+
+
+@app.get("/api/dock/mode", response_model=DockModeResponse, tags=["docking"])
+async def get_dock_mode():
+    """
+    Current dock mode.
+
+    - `propeller_only`: open = slide open → lift up. close = propeller closer cycle
+      → lift down → slide close. The docking motors M1/M2 are never used.
+    - `full`: open also UNDOCKs at the end; close starts with the full DOCK sequence.
+    """
+    return _dock_mode_response(True, "ok")
+
+
+@app.put("/api/dock/mode", response_model=DockModeResponse, tags=["docking"])
+async def set_dock_mode(body: DockModeRequest):
+    """
+    Switch the dock mode. Takes effect from the next open/close, is saved, and
+    survives a restart. Refused (409) while a pad sequence or dock command is running.
+    """
+    mode = DockMode(body.mode)
+    ok, message = pad.set_dock_mode(mode)
+    if not ok:
+        raise HTTPException(status_code=409, detail=message)
+    try:
+        save_dock_mode(settings.dock_mode_file, mode)
+    except OSError as exc:
+        logger.error("Dock mode set to %s but could not be saved: %s", mode.value, exc)
+        return _dock_mode_response(True, f"{message}, but it could not be saved ({exc}) — it will revert on restart")
+    return _dock_mode_response(True, message)
 
 
 @app.post("/api/dock/reset", response_model=DockCommandResponse, tags=["docking"])

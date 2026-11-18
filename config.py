@@ -66,8 +66,25 @@ class DockStatus(str, Enum):
     DOCKING_M1 = "DOCKING_M1"
     DOCKING_PROP_OPEN = "DOCKING_PROP_OPEN"
     DOCKING_PROP_CLOSE = "DOCKING_PROP_CLOSE"
+    PROP_CYCLE_OPEN = "PROP_CYCLE_OPEN"    # PROPCYCLE: propeller closer opening (M1/M2 untouched)
+    PROP_CYCLE_CLOSE = "PROP_CYCLE_CLOSE"  # PROPCYCLE: propeller closer closing again
     TESTING = "TESTING"      # Bench jog (JOG1/2/3) in progress — firmware is busy
     ERROR = "ERROR"
+
+
+class DockMode(str, Enum):
+    """
+    What the pad's open/close sequences ask of the dock controller.
+
+    PROPELLER_ONLY: the two docking motors (M1/M2) are never used.
+        open  = slide open -> lift up                  (no UNDOCK)
+        close = propeller closer cycle -> lift down -> slide close
+    FULL: the original behaviour.
+        open  = slide open -> lift up -> UNDOCK
+        close = DOCK (M2 -> M1 -> propeller open -> close) -> lift down -> slide close
+    """
+    PROPELLER_ONLY = "propeller_only"
+    FULL = "full"
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +210,13 @@ class Settings:
     # --- Docking System (ESP32, USB serial) ---
     docking_config: DockingConfig = field(default_factory=DockingConfig)
 
+    # Startup default for the dock mode. A mode chosen at runtime through
+    # PUT /api/dock/mode is saved to dock_mode_file and takes precedence.
+    dock_mode: DockMode = DockMode.PROPELLER_ONLY
+    dock_mode_file: str = field(
+        default_factory=lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "dock_mode.json")
+    )
+
     def get_motor_pins(self, motor_id: MotorId) -> StepperPins:
         """Return the pin configuration for a given motor."""
         if motor_id == MotorId.OPENING:
@@ -244,6 +268,67 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes")
 
 
+def _env_dock_mode(name: str, default: DockMode) -> DockMode:
+    """Read a DockMode from an environment variable."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return DockMode(raw.strip().lower())
+    except ValueError:
+        logger.warning(
+            "Invalid dock mode %s=%r (use %s), using default %s",
+            name, raw, " or ".join(m.value for m in DockMode), default.value,
+        )
+        return default
+
+
+def load_saved_dock_mode(path: str) -> Optional[DockMode]:
+    """Return the dock mode saved by PUT /api/dock/mode, or None if there isn't one."""
+    import json
+    try:
+        with open(path, "r") as f:
+            return DockMode(json.load(f)["mode"])
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning("Ignoring unreadable dock mode file %s: %s", path, exc)
+        return None
+
+
+def save_dock_mode(path: str, mode: DockMode) -> None:
+    """Persist the dock mode atomically so it survives a service restart."""
+    import json
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"mode": mode.value}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _load_dotenv() -> None:
+    """
+    Load `.env` from this directory into os.environ, if it exists.
+
+    Real environment variables (e.g. systemd's Environment= lines) take
+    precedence — a value already set is never overridden. This is what makes
+    the documented `cp .env.example .env` workflow actually work, and gives
+    the service and the tools/ scripts one shared place for local overrides
+    such as re-mapped GPIO pins.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        logger.warning("%s exists but python-dotenv is not installed — ignoring it", path)
+        return
+    load_dotenv(path, override=False)
+    logger.info("Loaded local overrides from %s", path)
+
+
 def load_settings() -> Settings:
     """
     Build a Settings instance from environment variables.
@@ -256,6 +341,7 @@ def load_settings() -> Settings:
         DRONE_PAD_OPENING_STEP_DELAY_US=400
         DRONE_PAD_SIMULATION=true
     """
+    _load_dotenv()
     settings = Settings(
         host=os.environ.get("DRONE_PAD_HOST", "0.0.0.0"),
         port=_env_int("DRONE_PAD_PORT", 8000),
@@ -298,7 +384,9 @@ def load_settings() -> Settings:
             connect_timeout_seconds=_env_float("DRONE_PAD_DOCK_CONNECT_TIMEOUT_S", 10.0),
             command_timeout_seconds=_env_float("DRONE_PAD_DOCK_COMMAND_TIMEOUT_S", 120.0),
         ),
+        dock_mode=_env_dock_mode("DRONE_PAD_DOCK_MODE", DockMode.PROPELLER_ONLY),
     )
+    settings.dock_mode_file = os.environ.get("DRONE_PAD_DOCK_MODE_FILE", settings.dock_mode_file)
 
     logger.info("Settings loaded: simulation_mode=%s", settings.simulation_mode)
     logger.debug("Opening motor pins: %s", settings.opening_motor_pins)
